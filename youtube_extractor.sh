@@ -149,24 +149,31 @@ echo ""
 # ── 3. 자막 다운로드 (선택) ────────────────────────────────────────────────────
 echo -e "${YELLOW}[3/3] 📝 자막 다운로드 시도 중...${NC}"
 
-# Attempt 1 — English auto-captions
-yt-dlp --write-auto-sub --sub-lang en --sub-format vtt --skip-download \
-    -o "${SAFE_TITLE}" "$URL" 2>/dev/null || true
+# Use a fixed ASCII output stem so Korean/special characters in the title
+# never break the filename glob below.  yt-dlp appends .LANG.vtt automatically.
+SUB_STEM="subtitle"
 
-FOUND_VTT=$(ls *.vtt 2>/dev/null | head -1)
+# Attempt 1 — Korean auto-captions (primary: Korean golf broadcast → ko track)
+yt-dlp --write-auto-sub --sub-lang "ko" --sub-format vtt --skip-download \
+    -o "${SUB_STEM}" "$URL" 2>/dev/null || true
+FOUND_VTT=$(ls subtitle.ko.vtt 2>/dev/null | head -1)
 
-# Attempt 2 — Any available auto-caption language
+# Attempt 2 — All available auto-caption languages; prefer ko, accept any
 if [ -z "$FOUND_VTT" ]; then
-    echo -e "      (영어 자막 없음 — 다른 언어 자막 재시도 중...)"
-    yt-dlp --write-auto-sub --sub-format vtt --skip-download \
-        -o "${SAFE_TITLE}" "$URL" 2>/dev/null || true
-    FOUND_VTT=$(ls *.vtt 2>/dev/null | head -1)
+    echo -e "      (한국어 자막 없음 — 사용 가능한 모든 언어로 재시도 중...)"
+    yt-dlp --write-auto-sub --sub-langs "all" --sub-format vtt --skip-download \
+        -o "${SUB_STEM}" "$URL" 2>/dev/null || true
+    # Prefer Korean even from the all-language download
+    FOUND_VTT=$(ls subtitle.ko.vtt subtitle.ko-*.vtt 2>/dev/null | head -1)
+    if [ -z "$FOUND_VTT" ]; then
+        FOUND_VTT=$(ls *.vtt 2>/dev/null | head -1)
+    fi
 fi
 
 if [ -n "$FOUND_VTT" ]; then
     mv "$FOUND_VTT" "$VTT_FILE" 2>/dev/null || true
     HAS_SUBTITLES=1
-    echo -e "      ${GREEN}✅ 자막 저장: ${VTT_FILE}${NC}"
+    echo -e "      ${GREEN}✅ 자막 저장: ${VTT_FILE}  (원본: ${FOUND_VTT})${NC}"
 else
     echo -e "      ${YELLOW}⚠️  자막 없음 (자막 비활성화 또는 미지원 영상) — 계속 진행${NC}"
 fi

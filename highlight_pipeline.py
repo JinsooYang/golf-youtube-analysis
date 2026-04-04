@@ -87,11 +87,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--live-chat", "-l",
         metavar="FILE",
-        default=None,
+        default="output/live_chat_normalized.csv",
         dest="live_chat",
         help=(
-            "Path to live-chat CSV with timestamps. "
+            "Path to live-chat CSV with timestamps "
+            "(default: output/live_chat_normalized.csv). "
             "Optional — enables timestamp-based matching when present. "
+            "If the file does not exist the pipeline falls back to comment-only mode. "
             "Expected columns: timestamp_seconds (or time_seconds), text, author."
         ),
     )
