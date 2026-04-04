@@ -898,16 +898,31 @@ def extract_mentions_and_events(
                     canonical = resolve_canonical(raw)
                     title_counter[canonical] += 1
             # Event keywords via tokenizer
+            # Skip tokens that appear in a cheering/aspiration phrase —
+            # e.g. "우승 홧팅입니다" is encouragement, not a confirmed win.
+            cheer_match = _CHAT_CHEER_RE.search(text)
             for tok in tokenize_message(text):
                 if tok in _EVENT_SET:
+                    if cheer_match and cheer_match.group(1) == tok:
+                        continue   # token is the cheering keyword — skip
                     event_counter[GOLF_EVENTS[tok]] += 1
         return title_counter, event_counter
 
     title_ctr, event_ctr = _extract(primary_msgs)
+    used_fallback = False
 
     # If tight window found nothing, widen to full context
     if not title_ctr and not event_ctr:
         title_ctr, event_ctr = _extract(context_msgs)
+        used_fallback = True
+
+    # High-confidence events (우승, 홀인원, 연장전) require ≥2 occurrences to
+    # be accepted as evidence.  A single mention — especially from the broad
+    # context fallback window — is too easily a cheering phrase or casual
+    # reference that does not correspond to an actual event in this moment.
+    for canonical in list(event_ctr.keys()):
+        if canonical in _HIGH_CONFIDENCE_EVENTS and event_ctr[canonical] < 2:
+            del event_ctr[canonical]
 
     player_cands = [
         (name, cnt) for name, cnt in title_counter.most_common(8)
@@ -1113,6 +1128,20 @@ def extract_commentary_players(commentary_ctx: dict) -> list[str]:
 _COMM_NOT_CURRENT_RE = re.compile(
     r'(해야|하면|했을\s*때|안\s+하|를\s*못|두\s+개|세\s+개|두\s+번|잖아요|잖습니다|때도|아냈고|았고\s)'
 )
+
+# Chat messages that contain 우승/역전 in a cheering/aspiration context (e.g.
+# "우승 홧팅입니다", "우승 화이팅") are NOT evidence of an actual winning moment —
+# they are pre-game or mid-game encouragement directed at a player.
+# Match: event_token + optional whitespace + cheering/hope word.
+_CHAT_CHEER_RE = re.compile(
+    r'(우승|역전)\s*(홧팅|화이팅|파이팅|응원|기원|힘내|바랍니다|하세요|해요|하길|하시길|되시길|기도|하자|바람|바라|가즈아|가자)'
+)
+
+# These events are so significant that a single mention in the broad context
+# fallback window is not reliable — a real win / hole-in-one generates many
+# simultaneous reactions.  Require ≥2 occurrences in ANY window, otherwise
+# the evidence is too weak and the event is suppressed.
+_HIGH_CONFIDENCE_EVENTS = {"우승", "홀인원", "연장전"}
 
 
 def _extract_comm_events(commentary_ctx: dict) -> list[str]:

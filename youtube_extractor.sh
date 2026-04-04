@@ -105,13 +105,20 @@ SAFE_TITLE=$(echo "$TITLE" | tr -cd '[:alnum:] _-' | tr ' ' '_' | cut -c1-50)
 # ── 2. 영상 다운로드 (720p) — 주 목표 ──────────────────────────────────────────
 echo -e "${YELLOW}[2/3] 🎬 영상 다운로드 중 (720p)...${NC}"
 
-yt-dlp --extractor-args "youtube:player_client=android_creator" -f "best[height<=720]" \
-    -o "${VIDEO_FILE}" "$URL" 2>/dev/null
+# Format strategy:
+#   1st choice: best video ≤720p (any codec) + best audio, merged to mp4 via ffmpeg
+#   2nd choice: best combined stream ≤720p (format 18 etc.) — no merge needed
+#   3rd choice: any best available — last resort
+YTDLP_FMT="bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=720]+bestaudio/best[height<=720]/best"
+
+yt-dlp -f "$YTDLP_FMT" --merge-output-format mp4 \
+    -o "${VIDEO_FILE}" "$URL" 2>"${VIDEO_FILE%.mp4}_dl.log"
 RC=$?
 
-# Fallback: drop player_client hint, allow any container extension
+# Fallback: relax to any available format, allow any container extension
 if [ $RC -ne 0 ] || [ ! -f "$VIDEO_FILE" ]; then
-    yt-dlp -f "best[height<=720]" -o "video.%(ext)s" "$URL" 2>/dev/null
+    yt-dlp -f "bestvideo+bestaudio/best" --merge-output-format mp4 \
+        -o "video.%(ext)s" "$URL" 2>>"${VIDEO_FILE%.mp4}_dl.log"
     FOUND_VID=$(ls video.mp4 video.webm video.mkv 2>/dev/null | head -1)
     if [ -n "$FOUND_VID" ]; then
         VIDEO_FILE="$FOUND_VID"
@@ -123,6 +130,11 @@ if [ -f "$VIDEO_FILE" ]; then
     echo -e "      ${GREEN}✅ 영상 저장: ${VIDEO_FILE}${NC}"
 else
     echo -e "${RED}❌ 영상 다운로드 실패${NC}"
+    LOG_FILE="${VIDEO_FILE%.mp4}_dl.log"
+    if [ -f "$LOG_FILE" ]; then
+        echo -e "${RED}   오류 로그 (마지막 15줄):${NC}"
+        tail -15 "$LOG_FILE" | sed 's/^/   /'
+    fi
     # Write minimal metadata even on video failure so the folder is useful
     python3 -c "
 import json, sys
