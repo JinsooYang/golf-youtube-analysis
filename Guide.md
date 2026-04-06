@@ -18,33 +18,39 @@ Set `YOUTUBE_API_KEY` in `.env`.
 Analyzes real-time chat messages from a livestream replay. Detects spike moments
 where viewer reactions surged, identifies players, and produces a marketing insight report.
 
-### Steps
+### One-command workflow (recommended)
+
+Edit `config.json` at the repo root, then run:
 
 ```bash
-# 1. (Optional but recommended) Download video + subtitles
-#    Creates lesson_VIDEO_ID/ with video.mp4 and segments.json
-./youtube_extractor.sh "<URL>"
-
-# 2. Extract live chat replay
-python extract_live_chat.py "<URL>"
-
-# 3. Detect spikes, build highlight package
-#    Replace VIDEO_ID with the actual ID (e.g. owl8NxtVjfc)
-python highlight_pipeline.py \
-    --comments output/comments_cleaned.csv \
-    --live-chat output/live_chat_normalized.csv \
-    --video-id VIDEO_ID
-
-#    If you also have subtitle segments from step 1, add --segments:
-python highlight_pipeline.py \
-    --comments  output/comments_cleaned.csv \
-    --live-chat output/live_chat_normalized.csv \
-    --segments  lesson_VIDEO_ID/segments.json \
-    --video-id  VIDEO_ID
-
-# 4. Generate PDF report
-python generate_report_by_live_chat.py
+./generate_report config.json
 ```
+
+**`config.json`** (edit the URL before each run):
+
+```json
+{
+  "youtube_url":       "https://www.youtube.com/watch?v=VIDEO_ID",
+  "download_video":    true,
+  "analyze_subtitles": true,
+  "analyze_comments":  true,
+  "analyze_live_chat": true
+}
+```
+
+`generate_report` runs five steps in order, extracts the video ID automatically,
+and passes `--segments` to the highlight pipeline when subtitle segments are present.
+Each step is printed clearly; the script exits non-zero on failure.
+
+| Option | Controls | Fatal if fails? |
+|---|---|---|
+| `download_video` | `youtube_extractor.sh` | No — continues without video/subtitles |
+| `analyze_subtitles` | whether to pass `--segments` to the pipeline | n/a |
+| `analyze_comments` | `main.py` comment fetch (requires `YOUTUBE_API_KEY`) | Yes |
+| `analyze_live_chat` | `extract_live_chat.py` | Yes |
+
+Set any option to `false` to skip that step and reuse existing output files
+(e.g. `"download_video": false` skips re-downloading a video you already have).
 
 ### Output files
 
@@ -56,10 +62,48 @@ python generate_report_by_live_chat.py
 | `output/live_chat_extract.log` | Extraction status and parse statistics |
 | `output/spike_moments.csv` | Detected reaction spike windows |
 | `output/highlight_package.json` | Spike moments, shorts sequences, title suggestions |
-| `output/live_chat_insight_report.pdf` | **Final report** |
+| `output/live_chat_insight_report.pdf` | **Final report (full)** |
+| `output/live_chat_summary_report.pdf` | **Final report (summary)** |
 
 > **Note:** Live chat replay must be available. If the stream has ended and chat replay
-> is disabled, `extract_live_chat.py` exits with code `1` and logs `no_replay`.
+> is disabled, `extract_live_chat.py` exits with code `1` and `generate_report` stops
+> with a clear error.
+
+---
+
+### Step-by-step (for debugging or manual execution)
+
+Run individual steps when you need to inspect intermediate output or re-run a
+specific stage without repeating earlier ones.
+
+```bash
+# Step 1 — Download video + subtitles (optional)
+#   Creates lesson_VIDEO_ID/ with video.mp4 and segments.json
+./youtube_extractor.sh "<URL>"
+
+# Step 2 — Fetch YouTube comments (requires YOUTUBE_API_KEY in .env)
+python main.py "<URL>"
+
+# Step 3 — Extract live chat replay
+python extract_live_chat.py "<URL>"
+
+# Step 4 — Detect spikes, build highlight package
+#   Replace VIDEO_ID with the actual ID (e.g. owl8NxtVjfc)
+python highlight_pipeline.py \
+    --comments  output/comments_cleaned.csv \
+    --live-chat output/live_chat_normalized.csv \
+    --video-id  VIDEO_ID
+
+#   If subtitle segments exist from step 1, add --segments:
+python highlight_pipeline.py \
+    --comments  output/comments_cleaned.csv \
+    --live-chat output/live_chat_normalized.csv \
+    --segments  lesson_VIDEO_ID/segments.json \
+    --video-id  VIDEO_ID
+
+# Step 5 — Generate PDF report
+python generate_report_by_live_chat.py
+```
 
 ---
 

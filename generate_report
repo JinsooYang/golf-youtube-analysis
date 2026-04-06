@@ -1,0 +1,231 @@
+#!/bin/bash
+#
+# generate_report — config-driven live-chat report pipeline
+#
+# Usage:
+#   ./generate_report config.json
+#
+# Reads runtime options from a JSON config file and runs the full pipeline:
+#   Step 1  Download video + subtitles    (if download_video is true)
+#   Step 2  Fetch YouTube comments        (if analyze_comments is true)
+#   Step 3  Extract live chat replay      (if analyze_live_chat is true)
+#   Step 4  Build highlight package
+#   Step 5  Generate live-chat PDF report
+#
+# Output:
+#   output/live_chat_insight_report.pdf
+#   output/live_chat_summary_report.pdf
+#
+
+# ── Colour helpers ─────────────────────────────────────────────────────────────
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+step()  { echo -e "\n${BLUE}${BOLD}━━ $* ━━${NC}"; }
+ok()    { echo -e "${GREEN}✔  $*${NC}"; }
+warn()  { echo -e "${YELLOW}⚠  $*${NC}"; }
+skip()  { echo -e "${CYAN}–  $* (skipped)${NC}"; }
+fatal() { echo -e "${RED}✘  $*${NC}"; exit 1; }
+
+# ── Always run from the directory the script lives in ─────────────────────────
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
+# ── Argument validation ────────────────────────────────────────────────────────
+if [ -z "${1:-}" ]; then
+    echo -e "${BOLD}Usage:${NC}  ./generate_report config.json"
+    echo ""
+    echo "Reads all options from a JSON config file. Minimal example:"
+    echo ""
+    echo '  {'
+    echo '    "youtube_url":       "https://www.youtube.com/watch?v=VIDEO_ID",'
+    echo '    "download_video":    true,'
+    echo '    "analyze_subtitles": true,'
+    echo '    "analyze_comments":  true,'
+    echo '    "analyze_live_chat": true'
+    echo '  }'
+    echo ""
+    echo "Output:"
+    echo "  output/live_chat_insight_report.pdf"
+    echo "  output/live_chat_summary_report.pdf"
+    exit 1
+fi
+
+CONFIG_FILE="$1"
+[ -f "$CONFIG_FILE" ] || fatal "Config file not found: $CONFIG_FILE"
+
+# ── Parse config ───────────────────────────────────────────────────────────────
+read -r URL DOWNLOAD_VIDEO ANALYZE_SUBTITLES ANALYZE_COMMENTS ANALYZE_LIVE_CHAT \
+    < <(python3 - "$CONFIG_FILE" <<'PYEOF'
+import json, sys
+
+path = sys.argv[1]
+try:
+    cfg = json.load(open(path))
+except json.JSONDecodeError as e:
+    print("JSON parse error in {}: {}".format(path, e), file=sys.stderr)
+    sys.exit(1)
+
+url = cfg.get("youtube_url", "").strip()
+if not url:
+    print("Error: 'youtube_url' is missing or empty in config.", file=sys.stderr)
+    sys.exit(1)
+
+def b(key, default=True):
+    return "true" if cfg.get(key, default) else "false"
+
+print(url, b("download_video"), b("analyze_subtitles"),
+      b("analyze_comments"), b("analyze_live_chat"))
+PYEOF
+)
+
+[ -n "$URL" ] || fatal "Could not read config. Check the file is valid JSON and contains 'youtube_url'."
+
+# ── Extract video ID ───────────────────────────────────────────────────────────
+VIDEO_ID=$(python3 - "$URL" <<'PYEOF'
+import sys, re
+url = sys.argv[1]
+for pattern in [
+    r'[?&]v=([a-zA-Z0-9_-]{11})',
+    r'youtu\.be/([a-zA-Z0-9_-]{11})',
+    r'youtube\.com/(?:live|shorts)/([a-zA-Z0-9_-]{11})',
+]:
+    m = re.search(pattern, url)
+    if m:
+        print(m.group(1))
+        sys.exit(0)
+sys.exit(1)
+PYEOF
+) || true
+
+[ -n "$VIDEO_ID" ] || fatal "Could not extract a YouTube video ID from: $URL\nAccepted formats: ?v=ID, youtu.be/ID, /live/ID"
+
+LESSON_DIR="lesson_${VIDEO_ID}"
+SEGMENTS_FILE="${LESSON_DIR}/segments.json"
+
+echo ""
+echo -e "${BOLD}╔══════════════════════════════════════════╗${NC}"
+echo -e "${BOLD}║   Golf YouTube Live-Chat Report          ║${NC}"
+echo -e "${BOLD}╚══════════════════════════════════════════╝${NC}"
+echo -e "  Config   : ${CYAN}${CONFIG_FILE}${NC}"
+echo -e "  Video ID : ${CYAN}${VIDEO_ID}${NC}"
+echo -e "  Options  : download_video=${DOWNLOAD_VIDEO}  analyze_subtitles=${ANALYZE_SUBTITLES}  analyze_comments=${ANALYZE_COMMENTS}  analyze_live_chat=${ANALYZE_LIVE_CHAT}"
+
+mkdir -p output
+
+# ── Step 1: Download video + subtitles ────────────────────────────────────────
+step "Step 1/5  Video download + subtitle extraction"
+
+if [ "$DOWNLOAD_VIDEO" = "true" ]; then
+    if bash youtube_extractor.sh "$URL"; then
+        ok "Video download complete."
+    else
+        warn "youtube_extractor.sh failed — continuing without video/subtitles."
+    fi
+else
+    skip "download_video is false"
+fi
+
+# Decide whether segments are usable (regardless of how they got there)
+if [ "$ANALYZE_SUBTITLES" = "true" ] && [ -f "$SEGMENTS_FILE" ]; then
+    USE_SEGMENTS=true
+    ok "Subtitle segments found: ${SEGMENTS_FILE}"
+else
+    USE_SEGMENTS=false
+    if [ "$ANALYZE_SUBTITLES" = "true" ]; then
+        warn "No segments file at ${SEGMENTS_FILE} — pipeline will run without --segments."
+    else
+        skip "analyze_subtitles is false"
+    fi
+fi
+
+# ── Step 2: Fetch YouTube comments ────────────────────────────────────────────
+step "Step 2/5  YouTube comment fetch"
+
+if [ "$ANALYZE_COMMENTS" = "true" ]; then
+    if ! python3 main.py "$URL"; then
+        fatal "main.py failed. Check that YOUTUBE_API_KEY is set in .env and the video is public."
+    fi
+    [ -f "output/comments_cleaned.csv" ] \
+        || fatal "output/comments_cleaned.csv was not created. Check main.py output above."
+    COMMENT_LINES=$(wc -l < "output/comments_cleaned.csv" | tr -d ' ')
+    ok "Comments fetched — ${COMMENT_LINES} lines (including header)."
+else
+    skip "analyze_comments is false"
+    if [ ! -f "output/comments_cleaned.csv" ]; then
+        warn "output/comments_cleaned.csv not found — highlight pipeline will run in live-chat-only mode."
+        echo "comment_id,author,text,like_count,is_reply,reply_count,published_at" \
+            > output/comments_cleaned.csv
+    fi
+fi
+
+# ── Step 3: Extract live chat replay ──────────────────────────────────────────
+step "Step 3/5  Live chat extraction"
+
+if [ "$ANALYZE_LIVE_CHAT" = "true" ]; then
+    if ! python3 extract_live_chat.py "$URL"; then
+        fatal "Live chat extraction failed.\nPossible causes:\n  • Stream has not ended yet\n  • Chat replay is disabled for this video\n  • yt-dlp is outdated — run: pip install -U yt-dlp"
+    fi
+    [ -f "output/live_chat_normalized.csv" ] \
+        || fatal "output/live_chat_normalized.csv was not created. Check output/live_chat_extract.log."
+    CHAT_LINES=$(wc -l < "output/live_chat_normalized.csv" | tr -d ' ')
+    ok "Live chat extracted — ${CHAT_LINES} lines (including header)."
+else
+    skip "analyze_live_chat is false"
+    [ -f "output/live_chat_normalized.csv" ] \
+        || fatal "analyze_live_chat is false but output/live_chat_normalized.csv does not exist.\nEnable analyze_live_chat or provide the file manually."
+fi
+
+# ── Step 4: Highlight pipeline ────────────────────────────────────────────────
+step "Step 4/5  Highlight pipeline (spike detection)"
+
+PIPELINE_CMD=(python3 highlight_pipeline.py
+    --comments  output/comments_cleaned.csv
+    --live-chat output/live_chat_normalized.csv
+    --video-id  "$VIDEO_ID"
+)
+
+if [ "$USE_SEGMENTS" = "true" ]; then
+    PIPELINE_CMD+=(--segments "$SEGMENTS_FILE")
+    ok "Including subtitle segments."
+else
+    warn "Running without subtitle segments (semantic matching mode)."
+fi
+
+if ! "${PIPELINE_CMD[@]}"; then
+    fatal "highlight_pipeline.py failed."
+fi
+ok "Highlight package built: output/highlight_package.json"
+
+# ── Step 5: Generate PDF report ───────────────────────────────────────────────
+step "Step 5/5  PDF report generation"
+
+if ! python3 generate_report_by_live_chat.py; then
+    fatal "generate_report_by_live_chat.py failed."
+fi
+
+# ── Summary ───────────────────────────────────────────────────────────────────
+echo ""
+echo -e "${BOLD}╔══════════════════════════════════════════╗${NC}"
+echo -e "${BOLD}║   Done                                   ║${NC}"
+echo -e "${BOLD}╚══════════════════════════════════════════╝${NC}"
+echo ""
+
+for f in \
+    "output/live_chat_insight_report.pdf" \
+    "output/live_chat_summary_report.pdf" \
+    "output/highlight_package.json" \
+    "output/spike_moments.csv"
+do
+    if [ -f "$f" ]; then
+        SIZE=$(du -sh "$f" 2>/dev/null | cut -f1)
+        ok "${f}  (${SIZE})"
+    fi
+done
+
+echo ""

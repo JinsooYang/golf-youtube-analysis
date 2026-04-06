@@ -14,10 +14,15 @@ Output: output/live_chat_insight_report.pdf
 """
 
 import csv
+import difflib
+import functools
 import json
 import math
 import re
 import sys
+import time
+import urllib.error
+import urllib.request
 from collections import Counter
 from pathlib import Path
 
@@ -582,14 +587,620 @@ _KR_STOPWORDS = {
     "프로", "선수", "코치", "감독",
 }
 
-# Matches (name)(title) pattern — adjacent, for chat messages (e.g. 이성훈선수, 문서형프로)
+# ── Player name morphological validator ───────────────────────────────────────
+#
+# The (name)(title) regex alone is too permissive: it captures verb-modifier
+# phrases and common nouns as if they were person names.
+# Examples of false positives:
+#   따라가는 선수  → "따라가는" captured as name  (present-tense modifier)
+#   우승권 선수    → "우승권" captured as name     (compound noun, winning contention)
+#   넘길 선수      → "넘길" captured as name       (future/potential modifier)
+#   있는 선수      → "있는" captured as name       (existential modifier)
+#   명의 선수      → "명의" captured as name       (possessive counting phrase)
+#
+# Three-layer guard applied to every extracted name candidate.
+
+# Layer 1 — Last-syllable grammar particle check.
+# These Korean syllables never appear as the last character of a real name.
+_NAME_GRAMMAR_SUFFIX: frozenset[str] = frozenset({
+    '는',  # present-tense modifier: 있는, 없는, 따라가는, 추격하는, 완성시키는…
+    '들',  # plural marker: 선수들, 명의들
+    '의',  # possessive particle: 명의, 여덟명의, 세명의
+    '을',  # object marker / ㄹ-future modifier: 위권을, 할[것]을
+    '며',  # conjunctive ending: 이며
+})
+
+# Layer 2 — Multi-char verb/adjective modifier endings.
+# Relative-clause modifiers in Korean always end in one of these patterns
+# when they precede a noun like 선수. None of these can be a name's own ending.
+_NAME_FORBIDDEN_ENDINGS: tuple[str, ...] = (
+    '하는',     # doing/making
+    '가는',     # going
+    '오는',     # coming
+    '있는',     # being/existing
+    '없는',     # not-having
+    '되는',     # becoming
+    '치는',     # hitting/playing
+    '시키는',   # causing/making
+    '잘하는',   # doing well
+    '추격하는', # chasing
+    '따라가는', # following
+    '완성시키는', # completing
+    '좋아하는', # liking
+    '세우는',   # stopping/holding
+    '넘기기',   # passing-over (verbal noun)
+    '해본',     # past-tense experiential: 시도해본, 도전해본, 겪어본 …
+    '하본',     # variant spelling (colloquial ASR artefact)
+    '어본',     # experiential ending: 해보다 → 해봐본 → 어본
+)
+
+# Layer 3 — Domain-specific non-name compound blocklist.
+# Golf/broadcast compound words that the regex confuses with player names.
+_NON_PLAYER_NAMES: frozenset[str] = frozenset({
+    '우승권',   # "winning contention" — 우승권 선수 = "players in contention"
+    '선두권',   # "lead contention"
+    '추격권',   # "chasing range"
+    '장타',     # "long drive" — 장타 선수 = "long-driver"
+    '선두',     # "lead / leader position"
+    '넘길',     # "to beat/exceed" — 넘길 선수 = "player to beat" (verb modifier)
+    '보인',     # "seen/appeared" — 보인 선수 = "the player who appeared"
+    '결국이',   # "ultimately" (adverb form)
+    '보면이',   # "if you look" (conditional form)
+    '방송을',   # "broadcast" (ASR error fragment)
+    '클럽은',   # "the club" + topic particle
+    '위권을',   # "position" + object particle
+    '현두권',   # not a real name in this broadcast context
+    '명의',     # "member's / in-name-of" (counting phrase particle)
+})
+
+
+# ── Official GTour / WGTour player list ──────────────────────────────────────
+#
+# Fetched once per session (or loaded from cache) and used as the primary
+# authority for name validation.  Any name found in the official roster is
+# accepted as a valid candidate regardless of the grammar-filter rules below.
+# Names NOT in the official list still go through the three-layer filter.
+#
+_GTOUR_PLAYERS_CACHE = OUTPUT_DIR / "gtour_players.json"
+_GTOUR_CACHE_TTL_DAYS = 7          # re-fetch after this many days
+_GTOUR_API_BASE = "https://www.gtour.com/api/player/list"
+
+
+def _fetch_gtour_page(tour_type: int, page: int) -> tuple[list[str], int]:
+    """
+    Fetch one page of player names from the GTour JSON API.
+    Returns (names, total) where total is the server-reported total player count.
+    """
+    url = f"{_GTOUR_API_BASE}?type={tour_type}&page={page}&rows=100"
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    body = data.get("data", {}) or {}
+    player_list = body.get("playerList", [])
+    total = int(body.get("total", 0))
+    names = [p["userName"].strip() for p in player_list if p.get("userName")]
+    return names, total
+
+
+def _fetch_and_cache_gtour_players() -> frozenset[str]:
+    """
+    Return a frozenset of all official GTour + WGTour player names.
+
+    Tries to load from gtour_players.json (cached for _GTOUR_CACHE_TTL_DAYS days).
+    On failure (network error, stale/missing cache), returns an empty frozenset
+    so the system degrades gracefully to the grammar-only filter.
+    """
+    # Check cache freshness
+    if _GTOUR_PLAYERS_CACHE.exists():
+        age_days = (time.time() - _GTOUR_PLAYERS_CACHE.stat().st_mtime) / 86400
+        if age_days < _GTOUR_CACHE_TTL_DAYS:
+            try:
+                cached = json.loads(_GTOUR_PLAYERS_CACHE.read_text(encoding="utf-8"))
+                if isinstance(cached, list) and cached:
+                    return frozenset(cached)
+            except (json.JSONDecodeError, OSError):
+                pass   # fall through to re-fetch
+
+    names: list[str] = []
+    try:
+        for tour_type in (5, 6):
+            page = 1
+            while True:
+                page_names, total = _fetch_gtour_page(tour_type, page)
+                if not page_names:
+                    break
+                names.extend(page_names)
+                # Stop when we've collected enough pages
+                max_pages = math.ceil(total / 100) if total else 50
+                if page >= max_pages:
+                    break
+                page += 1
+        if names:
+            try:
+                _GTOUR_PLAYERS_CACHE.write_text(
+                    json.dumps(names, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+            except OSError:
+                pass
+    except (urllib.error.URLError, OSError, KeyError, json.JSONDecodeError):
+        # Network unavailable or API changed — use stale cache if present
+        if _GTOUR_PLAYERS_CACHE.exists():
+            try:
+                cached = json.loads(_GTOUR_PLAYERS_CACHE.read_text(encoding="utf-8"))
+                if isinstance(cached, list):
+                    return frozenset(cached)
+            except (json.JSONDecodeError, OSError):
+                pass
+        return frozenset()
+
+    return frozenset(names)
+
+
+# Load official player names at module startup (cached on disk, fast re-load).
+_OFFICIAL_PLAYER_NAMES: frozenset[str] = _fetch_and_cache_gtour_players()
+
+# Pre-build a set of 3+ syllable official names for bare-name scanning.
+# Only 3+ syllables: shorter names (e.g. "박" = 1) cause false positives.
+_OFFICIAL_BARE_NAMES: frozenset[str] = frozenset(
+    n for n in _OFFICIAL_PLAYER_NAMES if len(n) >= 3
+)
+
+# Pre-bucket official names by first syllable for fast fuzzy lookup.
+# _OFFICIAL_BY_FIRST["공"] = ["공태현", "공민준", ...]
+_OFFICIAL_BY_FIRST: dict[str, list[str]] = {}
+for _n in _OFFICIAL_PLAYER_NAMES:
+    if _n:
+        _OFFICIAL_BY_FIRST.setdefault(_n[0], []).append(_n)
+
+# Pre-build last-two-syllable suffix index for given-name lookup.
+# _OFFICIAL_BY_SUFFIX["한백"] = ["송한백"]
+# Used by _find_by_given_name to resolve partial given-name references
+# (e.g. "한백형" → strip "형" → "한백" → suffix lookup → "송한백").
+_OFFICIAL_BY_SUFFIX: dict[str, list[str]] = {}
+for _n in _OFFICIAL_PLAYER_NAMES:
+    _bare = _n.rstrip("0123456789")   # strip disambiguation digits
+    for _sfx_len in (2, 3):           # 2- and 3-syllable suffixes
+        if len(_bare) > _sfx_len:
+            _sfx = _bare[-_sfx_len:]
+            _OFFICIAL_BY_SUFFIX.setdefault(_sfx, []).append(_n)
+
+# Social/honorific suffixes in Korean live-chat.
+# Ordered longest-first so greedy stripping takes the longest matching suffix.
+# These are treated as WRAPPERS, not identity tokens: 한백햄 → 한백, 준형선수 → 준형.
+_SOCIAL_SUFFIXES_ORDERED: tuple[str, ...] = (
+    "프로님", "선수님", "형님",          # 3-char (longest first)
+    "프로",   "선수",   "햄",   "형",   # 2-char
+    "님",                               # 1-char (weakest — last resort only)
+)
+
+
+@functools.lru_cache(maxsize=512)
+def _correct_player_name(name: str) -> str:
+    """
+    If `name` matches an official GTour/WGTour player exactly, return as-is.
+    Otherwise find the closest official name that shares the same first syllable
+    and is within ±1 character of the same length.
+
+    Returns the original `name` unchanged if:
+      - The official list is empty (network unavailable, no cache)
+      - No candidate clears the similarity threshold (0.75)
+      - The name is already official
+
+    Cached: identical inputs always return the same result without re-computing.
+    """
+    if not _OFFICIAL_PLAYER_NAMES or name in _OFFICIAL_PLAYER_NAMES:
+        return name
+    if len(name) < 2:
+        return name
+    # Only compare same-first-syllable, similar-length candidates
+    candidates = [
+        n for n in _OFFICIAL_BY_FIRST.get(name[0], [])
+        if abs(len(n) - len(name)) <= 1
+    ]
+    if not candidates:
+        return name
+    matches = difflib.get_close_matches(name, candidates, n=1, cutoff=0.75)
+    return matches[0] if matches else name
+
+
+# Suffixes appended to canonical names (e.g. "공태현 프로" → bare "공태현")
+_CANONICAL_TITLE_SUFFIXES = (" 프로", " 선수", " 코치", " 감독", "님")
+
+
+# ── Generalized GTour player normalization ────────────────────────────────────
+#
+# Design goals
+# ─────────────
+# Recall  : resolve informal chat variants (한백형 → 송한백, 준형선수 → 김준형 프로)
+# Precision: reject ASR noise / unsupported strings (유영희 → None)
+# Anchor  : the official GTour/WGTour roster is the PRIMARY truth source,
+#           not a fallback — every accepted name must trace back to it.
+
+
+def _strip_social_suffix(token: str) -> str:
+    """
+    Strip the longest matching social/honorific suffix from a token.
+    Returns the bare base name (token unchanged if no suffix matched).
+
+    Examples
+    --------
+    한백형님 → 한백   (형님 stripped)
+    한백햄   → 한백   (햄  stripped)
+    준형선수 → 준형   (선수 stripped)
+    최민욱   → 최민욱 (no suffix)
+    """
+    for suf in _SOCIAL_SUFFIXES_ORDERED:
+        if token.endswith(suf) and len(token) > len(suf):
+            return token[: -len(suf)]
+    return token
+
+
+@functools.lru_cache(maxsize=512)
+def _find_by_given_name(token: str) -> str | None:
+    """
+    Resolve a partial given-name token (이름 component) to a unique official
+    GTour/WGTour player name via the prebuilt suffix index.
+
+    Korean names follow 성(1–2자) + 이름(1–2자).  A viewer typing "한백형"
+    is using the given-name "한백" of player 송한백.  This function finds
+    that mapping.
+
+    Rules (all must hold)
+    ─────────────────────
+    - token must be ≥ 2 syllables (single syllables are too ambiguous)
+    - EXACTLY one official player whose bare name ends with token
+      (uniqueness = confidence; multiple matches → ambiguous → None)
+    - The matching official name must be strictly LONGER than token
+      (exact-length matches are covered by the official-exact path)
+
+    Returns the official name string (e.g. "송한백") or None.
+    """
+    if not _OFFICIAL_PLAYER_NAMES or len(token) < 2:
+        return None
+    candidates = _OFFICIAL_BY_SUFFIX.get(token, [])
+    # Filter to names that are strictly longer than the token
+    valid = [n for n in candidates
+             if len(n.rstrip("0123456789")) > len(token)]
+    return valid[0] if len(valid) == 1 else None
+
+
+def _to_canonical_official(official_name: str) -> str:
+    """
+    Convert a raw official GTour name to its canonical display form.
+
+    Priority
+    ────────
+    1. PLAYER_ALIASES exact lookup (e.g. "최민욱" → "최민욱 프로")
+    2. Common title-form alias lookup (e.g. "최민욱프로" in PLAYER_ALIASES)
+    3. Bare official name as-is (e.g. "송한백" has no alias → "송한백")
+
+    We intentionally do NOT automatically append " 프로" here: players without
+    an explicit PLAYER_ALIASES entry keep their raw official name so they remain
+    consistent with what the bare-name scanner produces elsewhere.
+    """
+    if official_name in PLAYER_ALIASES:
+        return PLAYER_ALIASES[official_name]
+    for suf in ("프로", "선수", "프로님", "선수님"):
+        alias_form = official_name + suf
+        if alias_form in PLAYER_ALIASES:
+            return PLAYER_ALIASES[alias_form]
+    return official_name   # no alias → use official name directly
+
+
+@functools.lru_cache(maxsize=2048)
+def normalize_player_token(raw: str) -> str | None:
+    """
+    Normalize ANY raw player-name token (live-chat or ASR subtitle) to a
+    canonical form that traces back to the official GTour/WGTour roster.
+
+    This is the SINGLE entry point for all player-name normalization in the
+    pipeline.  It replaces the previous piecemeal chain of
+      _is_valid_name_candidate → _correct_player_name → resolve_canonical.
+
+    The official roster is the PRIMARY anchor: a name that cannot be resolved
+    to an official player is returned as None and silently discarded — it is
+    never promoted to report level.
+
+    Resolution layers (first match wins)
+    ─────────────────────────────────────
+    L1  PLAYER_ALIASES exact          — explicit curated mappings (highest trust)
+    L2  Official roster exact         — verbatim in the GTour API list
+    L3  Stripped base → L1            — strip social suffix, then alias lookup
+    L4  Stripped base → L2            — strip social suffix, then roster exact
+    L5  Stripped base → given-name scan — unique suffix match in official names
+    L6  Raw token → given-name scan   — (for tokens with no recognized suffix)
+    L7  Stripped base → fuzzy (≥ 0.85, same-first-syllable, length ≤ ±0)
+
+    Graceful degradation: when the official list is unavailable (empty), L2–L7
+    are skipped and L1 is the only gate — the function still works but with
+    lower precision.
+
+    Returns None if no reliable match is found.
+
+    Examples (with roster available)
+    ─────────────────────────────────
+    "최민욱선수" → L1 PLAYER_ALIASES        → "최민욱 프로"
+    "김준형프로" → L1 PLAYER_ALIASES        → "김준형 프로"
+    "한백형"    → L3 (strip 형 → 한백)
+                   L5 given-name (한백 → 송한백) → "송한백"
+    "한백햄"    → same as 한백형            → "송한백"
+    "준형선수"  → L3 (strip 선수 → 준형)
+                   L5 given-name (준형 → 김준형) → "김준형 프로"
+    "유영희선수" → L1 miss; L2 miss;
+                  L3 strip → 유영희; L4 miss;
+                  L5 given-name(유영희) → multiple or None;
+                  L7 fuzzy miss → None  ✗ rejected
+    """
+    raw = raw.strip()
+    if not raw or len(raw) < 2:
+        return None
+
+    # ── L1: PLAYER_ALIASES exact ─────────────────────────────────────────────
+    if raw in PLAYER_ALIASES:
+        return PLAYER_ALIASES[raw]
+
+    # ── L2: Official roster exact ────────────────────────────────────────────
+    if _OFFICIAL_PLAYER_NAMES and raw in _OFFICIAL_PLAYER_NAMES:
+        return _to_canonical_official(raw)
+
+    # When the official list is unavailable, degrade to alias-only mode
+    if not _OFFICIAL_PLAYER_NAMES:
+        return None
+
+    # ── L3–L5: Strip social suffix, then try resolution ──────────────────────
+    base = _strip_social_suffix(raw)
+    if base and base != raw and len(base) >= 2:
+        # L3: stripped base → PLAYER_ALIASES
+        if base in PLAYER_ALIASES:
+            return PLAYER_ALIASES[base]
+        # Also try common title forms of the base in PLAYER_ALIASES
+        for suf in ("프로", "선수", "프로님", "선수님", "형"):
+            if base + suf in PLAYER_ALIASES:
+                return PLAYER_ALIASES[base + suf]
+        # L4: stripped base → official roster exact
+        if base in _OFFICIAL_PLAYER_NAMES:
+            return _to_canonical_official(base)
+        # L5: stripped base → given-name suffix scan (unique match only)
+        gn = _find_by_given_name(base)
+        if gn:
+            return _to_canonical_official(gn)
+
+    # ── L6: Raw token → given-name suffix scan ───────────────────────────────
+    # Handles bare given-name tokens with no recognized social suffix
+    # (e.g. "민욱" alone, though 2-char given names often match multiple players)
+    gn = _find_by_given_name(raw)
+    if gn:
+        return _to_canonical_official(gn)
+
+    # ── L7: Fuzzy match — same first syllable, identical length, ≥ 0.85 ──────
+    # More conservative than _correct_player_name (0.75 → 0.85, length ±0 not ±1)
+    # to avoid matching plausible-but-wrong names from ASR noise.
+    target = base if (base and base != raw and len(base) >= 2) else raw
+    if len(target) >= 2:
+        candidates = [
+            n for n in _OFFICIAL_BY_FIRST.get(target[0], [])
+            if len(n.rstrip("0123456789")) == len(target)   # exact length only
+        ]
+        if candidates:
+            matches = difflib.get_close_matches(target, candidates, n=1, cutoff=0.85)
+            if matches:
+                return _to_canonical_official(matches[0])
+
+    return None   # could not resolve — discard, do not promote to report level
+
+
+# ── Context-sensitive disambiguation ─────────────────────────────────────────
+#
+# normalize_player_token (above) is context-free and cached — it can resolve
+# unambiguous tokens anywhere.  When a stripped base matches MULTIPLE official
+# roster entries (e.g. "민욱" → ["최민욱", "유민욱"]), the function correctly
+# returns None rather than guessing.
+#
+# The functions below add a SECOND PASS inside enrich_spike, where we have
+# access to the spike's local evidence (already-resolved names + raw text).
+# That context lets us confidently pick between ambiguous candidates.
+
+
+def _get_suffix_candidates(base: str) -> list[str]:
+    """
+    Return ALL official-roster players whose name ends with `base`.
+
+    Unlike _find_by_given_name this does NOT require uniqueness — it returns
+    every candidate so _context_disambiguate can choose between them.
+
+    Examples
+    --------
+    "민욱" → ["최민욱", "유민욱"]   (2 candidates — ambiguous without context)
+    "한백" → ["송한백"]             (1 candidate — unique, same as _find_by_given_name)
+    "준형" → ["김준형", "이준형"]   (2 candidates — context needed)
+    """
+    if not _OFFICIAL_PLAYER_NAMES or len(base) < 2:
+        return []
+    candidates = _OFFICIAL_BY_SUFFIX.get(base, [])
+    return [n for n in candidates if len(n.rstrip("0123456789")) > len(base)]
+
+
+def _context_disambiguate(
+    candidates: list[str],          # official roster names, e.g. ["최민욱", "유민욱"]
+    context_names: frozenset[str],  # canonical names already confirmed in this window
+    context_text: str,              # raw text from commentary + chat in this window
+) -> str | None:
+    """
+    Resolve an ambiguous short-form mention using local spike/window evidence.
+
+    Scoring signals (per candidate official name)
+    ─────────────────────────────────────────────
+    +4  canonical form is in context_names
+        (full name was already resolved elsewhere in this window — strongest signal)
+    +2  per literal occurrence of the bare official name in context_text
+    +1  per literal occurrence of the canonical form in context_text
+
+    Resolution threshold
+    ────────────────────
+    Resolve when BOTH:
+      top_score ≥ 2                     (some positive evidence, not zero)
+      top_score − second_score ≥ 2      (clearly dominant, not a coin flip)
+
+    Returns the winning canonical form, or None if evidence is insufficient.
+
+    Example (spike #1, anchor 12580s)
+    ──────────────────────────────────
+    Token "민욱프로" → base "민욱" → candidates ["최민욱", "유민욱"]
+    context_names  = frozenset({"최민욱 프로"})      ← resolved from commentary
+    context_text   = "최민욱이고요 … 최민욱 선수가 차지했습니다 …"
+
+      최민욱:  +4 (in context_names) + 2×2 ("최민욱" appears twice) = 8
+      유민욱:  +0 + 0 = 0
+
+    → resolves to "최민욱 프로"  (score=8 ≥ 2, gap=8 ≥ 2)
+    """
+    if not candidates:
+        return None
+
+    scores: dict[str, float] = {}
+    for official in candidates:
+        canonical = _to_canonical_official(official)
+        score = 0.0
+
+        # Signal 1: canonical already confirmed in this window
+        if canonical in context_names:
+            score += 4.0
+
+        # Signal 2: bare official name appears literally in raw text
+        score += context_text.count(official) * 2.0
+
+        # Signal 3: canonical display form appears in raw text
+        if canonical != official:
+            # e.g. canonical = "최민욱 프로" → search "최민욱 프로" as-is
+            score += context_text.count(canonical) * 1.0
+
+        scores[canonical] = score
+
+    sorted_cands = sorted(scores.items(), key=lambda x: -x[1])
+    top_name, top_score = sorted_cands[0]
+
+    if top_score < 2.0:
+        return None  # no positive evidence — don't override the ambiguity guard
+
+    if len(sorted_cands) >= 2:
+        _, second_score = sorted_cands[1]
+        if top_score - second_score < 2.0:
+            return None  # two candidates too close — not safe to pick one
+
+    return top_name
+
+
+def normalize_with_context(
+    raw: str,
+    context_names: frozenset[str],
+    context_text: str,
+) -> str | None:
+    """
+    Context-aware extension of normalize_player_token.
+
+    Algorithm
+    ─────────
+    1. Try normalize_player_token(raw) — context-free, cached (L1–L7).
+       If it resolves, return immediately.
+    2. Strip social suffix to get base.
+    3. Get ALL suffix candidates for base via _get_suffix_candidates.
+    4. If candidates < 2 (unique or unknown), return None — no context needed.
+    5. Call _context_disambiguate with the local window evidence.
+
+    This is intentionally NOT a drop-in replacement for normalize_player_token.
+    Use it only at call sites inside enrich_spike (or equivalent) where the
+    window context is available.  Context-free call sites use normalize_player_token.
+
+    Parameters
+    ──────────
+    raw           : raw chat/ASR token (same format as normalize_player_token)
+    context_names : canonical player names already resolved in this spike window
+    context_text  : concatenated commentary + chat raw text from this window
+    """
+    # Fast path: unambiguous resolution (L1–L7)
+    result = normalize_player_token(raw)
+    if result is not None:
+        return result
+
+    # Ambiguity path: get all suffix candidates (may be multiple)
+    base = _strip_social_suffix(raw)
+    if not base or len(base) < 2:
+        base = raw
+
+    candidates = _get_suffix_candidates(base)
+    if len(candidates) < 2:
+        # 0 candidates = truly unknown name; 1 = would have been caught by L5 already
+        return None
+
+    return _context_disambiguate(candidates, context_names, context_text)
+
+
+def _is_official_player(canonical: str) -> bool:
+    """
+    Return True only if `canonical` resolves to a name in the official
+    GTour / WGTour player list.
+
+    Strips known title suffixes from the canonical name before checking,
+    so "공태현 프로" → checks "공태현" ∈ _OFFICIAL_PLAYER_NAMES.
+    Falls back to True when the official list is unavailable (empty),
+    so the section still renders gracefully without network access.
+    """
+    if not _OFFICIAL_PLAYER_NAMES:
+        return True   # can't filter without a list — show everything
+    bare = canonical
+    for suffix in _CANONICAL_TITLE_SUFFIXES:
+        if bare.endswith(suffix):
+            bare = bare[: -len(suffix)]
+            break
+    return bare in _OFFICIAL_PLAYER_NAMES
+
+
+def _is_valid_name_candidate(name: str) -> bool:
+    """
+    Return False if `name` looks like a grammatical phrase fragment or a
+    known non-player compound rather than a real Korean person's name.
+
+    Validation order:
+      0. If the name appears in the official GTour/WGTour roster → immediately valid.
+         (Overrides all grammar-filter rules — an official player's name is always
+         a valid candidate, even if it coincidentally ends in a grammar particle.)
+      1. Last syllable is a grammar particle (는/들/의/을/며)
+      2. Word ends in a multi-char verb/adjective modifier suffix
+      3. Word appears in the domain-specific non-player compound list
+    """
+    if not name or len(name) < 2:
+        return False
+    # Official roster check: if the name is known, accept it immediately.
+    if _OFFICIAL_PLAYER_NAMES and name in _OFFICIAL_PLAYER_NAMES:
+        return True
+    if name[-1] in _NAME_GRAMMAR_SUFFIX:
+        return False
+    for ending in _NAME_FORBIDDEN_ENDINGS:
+        if name.endswith(ending):
+            return False
+    if name in _NON_PLAYER_NAMES:
+        return False
+    return True
+
+# Matches (name)(title) pattern — adjacent, for chat messages.
+# Includes "햄" (affectionate fan suffix, e.g. 한백햄 → 한백 + 햄).
+# Suffix order matters: longer suffixes listed first (형님 before 형)
+# so the regex is greedy-correct without backtracking.
 _TITLE_RE = re.compile(
-    r'([\uAC00-\uD7A3]{2,5})(프로님|선수님|형님|프로|선수|형|님|코치|감독)'
+    r'([\uAC00-\uD7A3]{2,5})(프로님|선수님|형님|프로|선수|형|햄|님|코치|감독)'
 )
 # Same pattern with optional space — for subtitle/commentary text where natural
-# Korean spacing separates name and title (e.g. "이성훈 선수", "김용석 선수가")
+# Korean spacing separates name and title (e.g. "이성훈 선수", "김용석 선수가").
+# "햄" is a chat-only suffix and is intentionally NOT included here.
 _TITLE_RE_SPACED = re.compile(
     r'([\uAC00-\uD7A3]{2,5})\s*(프로님|선수님|형님|프로|선수|형|님|코치|감독)'
+)
+# Matches a single-syllable surname + 프로/선수 shorthand (e.g. 공프로, 하프로).
+# ONLY accepted when the full token (surname+title) is in PLAYER_ALIASES —
+# single-syllable names are too ambiguous to accept without a known alias.
+_SHORT_PLAYER_RE = re.compile(
+    r'([\uAC00-\uD7A3]{1})(프로님|선수님|프로|선수)'
 )
 
 # ── Player alias / identity table ─────────────────────────────────────────────
@@ -608,20 +1219,47 @@ PLAYER_ALIASES: dict[str, str] = {
     "골과장님":   "골과장님",
     "과장님":     "골과장님",
     # 이성훈  — professional player
+    "이성훈":       "이성훈 프로",   # bare name → canonical
     "이성훈프로":   "이성훈 프로",
     "이성훈프로님": "이성훈 프로",
     "이성훈선수":   "이성훈 프로",
     "성훈프로":     "이성훈 프로",
     # 하기원  — professional player
+    "하기원":       "하기원 프로",   # bare name → canonical
     "하기원프로":   "하기원 프로",
     "하기원선수":   "하기원 프로",
     "하프로님":     "하기원 프로",
     # 공태현  — professional player
+    "공태현":       "공태현 프로",   # bare name → canonical (merges bare-name scan)
     "공태현프로":   "공태현 프로",
     "공태현선수":   "공태현 프로",
+    "공프로":       "공태현 프로",   # 1-char surname + 프로 shorthand
+    "공프로님":     "공태현 프로",
+    "공태영":       "공태현 프로",   # ASR/typo error: 영→현 vowel confusion
+    "공태영프로":   "공태현 프로",
+    "공태영선수":   "공태현 프로",
     # 이용희  — professional player
+    "이용희":       "이용희 프로",   # bare name → canonical
     "이용희프로":   "이용희 프로",
     "이용희선수":   "이용희 프로",
+    # 최민욱  — tournament winner (this broadcast)
+    "최민욱":       "최민욱 프로",   # bare name → canonical
+    "최민욱프로":   "최민욱 프로",
+    "최민욱선수":   "최민욱 프로",
+    "최프로":       "최민욱 프로",   # shorthand seen in chat: "최프로 우승 축하~~"
+    # 김준형  — discovery / emerging player (this broadcast)
+    "김준형":       "김준형 프로",   # bare name → canonical
+    "김준형프로":   "김준형 프로",
+    "김준형선수":   "김준형 프로",
+    "준형이":       "김준형 프로",   # casual form seen in chat: "준형이 잘한다~~~~"
+    "준형선수":     "김준형 프로",   # suffix-only form — "준형" is ambiguous in roster; explicit alias
+    "준형프로":     "김준형 프로",   # same rationale
+    # 김준영 = YouTube ASR error for 김준형 (ㅎ→ㅇ final-syllable substitution)
+    # The commentator says "김준형" but the ASR transcribes "김준영".
+    # Map it to the correct player so commentary extraction is accurate.
+    "김준영":       "김준형 프로",
+    "김준영선수":   "김준형 프로",
+    "김준영프로":   "김준형 프로",
     # 장태형
     "장태형":       "장태형",
     # 홍택이형
@@ -629,9 +1267,16 @@ PLAYER_ALIASES: dict[str, str] = {
     # 이장님  — chat nickname (appears during eagle scene)
     "이장님":       "이장님",
     # 김용석  — in-tournament player named in commentary
-    "김용석":       "김용석 선수",
+    "김용석":       "김용석 선수",   # bare name → canonical (also prevents split)
     "김용석선수":   "김용석 선수",
     "김용석프로":   "김용석 선수",
+    # 박래성  — in-tournament player; 혜→래 ASR/typo confusion
+    "박혜성":       "박래성 선수",
+    "박혜성선수":   "박래성 선수",
+    "박혜성프로":   "박래성 선수",
+    "박래성":       "박래성 선수",
+    "박래성선수":   "박래성 선수",
+    "박래성프로":   "박래성 선수",
     # 김영석  — YouTube auto-subtitle ASR error for 김용석 (ㅗ→ㅕ vowel confusion)
     #           The commentator says "김용석" but the ASR transcribes "김영석".
     #           Map it to the correct player so commentary extraction is accurate.
@@ -717,7 +1362,33 @@ ENTITY_REGISTRY: dict[str, dict] = {
         "aliases": ["김용석", "김용석선수", "김용석프로", "김영석", "김영석선수"],
         "author_patterns": [],
     },
+    "최민욱 프로": {
+        "role": "professional_player",
+        "role_label": "프로 선수",
+        "description": "G투어 프로 선수, 이번 대회 우승자",
+        "aliases": ["최민욱", "최민욱프로", "최민욱선수", "최프로"],
+        "author_patterns": [],
+    },
+    "김준형 프로": {
+        "role": "professional_player",
+        "role_label": "프로 선수",
+        "description": "G투어 프로 선수, 신인왕 출신, 이번 대회 발굴 후보",
+        # 김준영 = YouTube ASR error for 김준형 (ㅎ→ㅇ final-syllable substitution)
+        "aliases": ["김준형", "김준형프로", "김준형선수", "김준영", "김준영선수"],
+        "author_patterns": [],
+    },
 }
+
+
+# ── Non-player entity exclusion ──────────────────────────────────────────────
+#
+# Channel hosts and guest participants should not appear as analytical entities
+# in player-centric sections (discovery analysis, spike entity attribution, etc.)
+# Built from ENTITY_REGISTRY using channel_host / channel_participant roles.
+_NON_PLAYER_CANONICAL: frozenset[str] = frozenset(
+    name for name, info in ENTITY_REGISTRY.items()
+    if info.get("role") in ("channel_host", "channel_participant")
+)
 
 
 def detect_active_participants(text_msgs: list[dict]) -> dict[str, dict]:
@@ -889,14 +1560,40 @@ def extract_mentions_and_events(
         event_counter: Counter = Counter()
         for m in msgs:
             text = m.get("text", "") or ""
-            # Title-pattern player detection with canonical resolution
+            seen_in_msg: set[str] = set()   # avoid double-counting per message
+
+            # ── Title/social-suffix pattern: (name)(suffix) ───────────────────
+            # Routed through normalize_player_token — the official roster is the
+            # primary anchor.  Tokens that cannot be resolved to an official
+            # player (including stopwords, grammar fragments, and ASR noise)
+            # return None and are silently dropped.
             for match in _TITLE_RE.finditer(text):
-                name  = match.group(1)
-                title = match.group(2)
-                if name not in _KR_STOPWORDS:
-                    raw       = name + title
-                    canonical = resolve_canonical(raw)
+                raw_tok   = match.group(1) + match.group(2)
+                canonical = normalize_player_token(raw_tok)
+                if canonical and canonical not in seen_in_msg:
                     title_counter[canonical] += 1
+                    seen_in_msg.add(canonical)
+
+            # ── Short-name alias (single-syllable surname + 프로/선수) ─────────
+            # Routed through normalize_player_token (L1: PLAYER_ALIASES fast path).
+            for match in _SHORT_PLAYER_RE.finditer(text):
+                raw_tok   = match.group(1) + match.group(2)
+                canonical = normalize_player_token(raw_tok)
+                if canonical and canonical not in seen_in_msg:
+                    title_counter[canonical] += 1
+                    seen_in_msg.add(canonical)
+
+            # ── Bare official-name scanning (3+ syllable, no title suffix) ────
+            # Official names are already authoritative — no further validation
+            # needed.  resolve_canonical applies PLAYER_ALIASES if configured.
+            if _OFFICIAL_BARE_NAMES:
+                for bare in _OFFICIAL_BARE_NAMES:
+                    if bare in text:
+                        canonical = resolve_canonical(bare)
+                        if canonical not in seen_in_msg:
+                            title_counter[canonical] += 1
+                            seen_in_msg.add(canonical)
+
             # Event keywords via tokenizer
             # Skip tokens that appear in a cheering/aspiration phrase —
             # e.g. "우승 홧팅입니다" is encouragement, not a confirmed win.
@@ -1082,12 +1779,16 @@ def load_segments(video_id: str) -> list[dict]:
 
 def extract_commentary_players(commentary_ctx: dict) -> list[str]:
     """
-    Extract canonical player names from commentary text (pre-spike + concurrent).
+    Extract canonical player names from commentary (subtitle) text.
 
-    This is the PRIMARY source for determining who the on-screen scene is about.
-    Commentary is produced before or simultaneous with the event, so names
-    mentioned here are almost always the on-screen subject — not conversational
-    references like chat messages can be.
+    This is the PRIMARY source for the on-screen scene subject.  Commentary
+    is produced before or simultaneous with the event, so names found here
+    are almost always the actual on-screen subject.
+
+    All candidates are routed through normalize_player_token, which requires
+    every name to trace back to the official GTour roster before acceptance.
+    This prevents YouTube ASR noise (e.g. "유영희" for a mis-transcribed player
+    name) from being promoted as primary spike entities.
 
     Returns list in order of first appearance, deduplicated.
     """
@@ -1097,14 +1798,16 @@ def extract_commentary_players(commentary_ctx: dict) -> list[str]:
     )
     seen: set[str] = set()
     result: list[str] = []
-    # Use the spaced variant: subtitle text uses natural Korean spacing
-    # (e.g. "이성훈 선수", "김용석 선수가") unlike chat where they are adjacent.
+    # Use the spaced regex: subtitle text uses natural Korean spacing
+    # (e.g. "이성훈 선수", "김용석 선수가").  The name and title groups are
+    # reconstructed without the space for normalize_player_token lookup.
     for match in _TITLE_RE_SPACED.finditer(combined):
-        name = match.group(1)
-        if name in _KR_STOPWORDS:
-            continue
-        # Reconstruct without space for alias lookup
-        canonical = resolve_canonical(name + match.group(2))
+        raw_tok  = match.group(1) + match.group(2)   # adjacent form for lookup
+        canonical = normalize_player_token(raw_tok)
+        if canonical is None:
+            continue   # not in roster → ASR noise / unsupported → discard
+        if canonical in _NON_PLAYER_CANONICAL:
+            continue   # channel host / participant — not a broadcast player
         if canonical not in seen:
             seen.add(canonical)
             result.append(canonical)
@@ -1514,6 +2217,85 @@ def build_buzz_summary(
     }
 
 
+def _select_primary_player(
+    comm_players: list[str],
+    chat_player_cands: list[tuple[str, int]],
+    peak_msgs: list[dict],
+) -> str | None:
+    """
+    Select the primary player for a spike with roster-backed validation.
+
+    Replaces the naive 'comm_players[0] if comm_players else ...' heuristic.
+    Prevents false entities (ASR noise, subtitle errors, ambiguous fragments)
+    from being promoted to primary player merely because they appear first in
+    the concurrent commentary window.
+
+    Validation contract
+    ───────────────────
+    Every candidate MUST trace back to the official GTour/WGTour roster
+    (via normalize_player_token, _is_official_player, or explicit PLAYER_ALIASES).
+    Unvalidated candidates are silently dropped.
+
+    Selection priority
+    ──────────────────
+    1. Corroborated: appears in BOTH validated commentary list AND validated
+       chat candidates → strongest evidence (two independent signals).
+    2. Chat-supported commentary: commentary player not in chat_player_cands,
+       but the player's name appears in raw peak message text → weaker support.
+    3. First validated commentary player (no chat corroboration at all).
+    4. Highest-count validated chat candidate (when no commentary players).
+    """
+    _alias_vals = set(PLAYER_ALIASES.values())
+
+    def _is_validated(name: str) -> bool:
+        if not _OFFICIAL_PLAYER_NAMES:
+            return True   # graceful degradation when roster unavailable
+        bare = name
+        for suf in _CANONICAL_TITLE_SUFFIXES:
+            if bare.endswith(suf):
+                bare = bare[: -len(suf)]
+                break
+        return bare in _OFFICIAL_PLAYER_NAMES or name in _alias_vals
+
+    valid_comm = [n for n in comm_players if _is_validated(n)]
+    valid_chat = [(n, c) for n, c in chat_player_cands if _is_validated(n)]
+
+    if not valid_comm and not valid_chat:
+        return None
+
+    # Build set of chat-candidate names for quick corroboration check
+    chat_cand_names = {n for n, _ in valid_chat}
+
+    # 1. Corroborated: player named in both commentary and chat event layer
+    corroborated = [n for n in valid_comm if n in chat_cand_names]
+    if corroborated:
+        return corroborated[0]
+
+    # 2. Chat-text-supported commentary player (scan raw peak messages)
+    if valid_comm:
+        def _chat_mentions(name: str) -> int:
+            bare = name
+            for suf in _CANONICAL_TITLE_SUFFIXES:
+                if bare.endswith(suf):
+                    bare = bare[: -len(suf)]
+                    break
+            return sum(
+                1 for m in peak_msgs
+                if bare in (m.get("text") or "") or name in (m.get("text") or "")
+            )
+        chat_counts = {n: _chat_mentions(n) for n in valid_comm}
+        # If the top-by-chat player has ≥ 1 peak mention, prefer it over
+        # the first-in-commentary player.
+        best = max(valid_comm, key=lambda n: chat_counts.get(n, 0))
+        if chat_counts.get(best, 0) > 0:
+            return best
+        # 3. First validated commentary player (no chat corroboration)
+        return valid_comm[0]
+
+    # 4. Chat only
+    return valid_chat[0][0] if valid_chat else None
+
+
 def enrich_spike(spike: dict, text_msgs: list[dict], segments: list[dict],
                  active_participants: dict | None = None) -> dict:
     """
@@ -1608,16 +2390,76 @@ def enrich_spike(spike: dict, text_msgs: list[dict], segments: list[dict],
         tight_event_msgs, context_event_msgs, min_count=1
     )
 
-    # Merged list: commentary players first (score=99), then chat-only additions
+    # Merged list: commentary players first (score=99), then chat-only additions.
+    # Non-player entities (channel hosts, participants) are stripped from both
+    # lists so they never appear as spike subjects or in the headline narrative.
+    comm_players    = [n for n in comm_players    if n not in _NON_PLAYER_CANONICAL]
+    chat_player_cands = [(n, c) for n, c in chat_player_cands
+                         if n not in _NON_PLAYER_CANONICAL]
+
+    # ── Context-resolution pass ───────────────────────────────────────────────
+    # normalize_player_token (L1–L7) is context-free: it drops any token whose
+    # given-name base matches multiple roster entries.  Now that we have already
+    # resolved the unambiguous names in this window, we can use those as evidence
+    # to disambiguate the dropped ambiguous tokens.
+    #
+    # Build a context snapshot from:
+    #   context_names — canonical names confirmed by L1–L7 (from both comm + chat)
+    #   context_text  — all raw text in the spike window (commentary + chat)
+    _ctx_resolved = frozenset(comm_players) | frozenset(n for n, _ in chat_player_cands)
+    _ctx_text = (
+        commentary_ctx.get("all_text", "")
+        + " "
+        + " ".join(m.get("text", "") for m in tight_msgs + peak_msgs)
+    )
+
+    # Re-scan tight-window event-layer messages for tokens that returned None.
+    _ctx_extra: Counter = Counter()
+    for m in tight_event_msgs:
+        _seen_in_msg: set[str] = set()
+        for match in _TITLE_RE.finditer(m.get("text", "")):
+            raw_tok = match.group(1) + match.group(2)
+            # Skip tokens already resolved in the primary pass
+            if normalize_player_token(raw_tok) is not None:
+                continue
+            resolved = normalize_with_context(raw_tok, _ctx_resolved, _ctx_text)
+            if resolved and resolved not in _NON_PLAYER_CANONICAL and resolved not in _seen_in_msg:
+                _ctx_extra[resolved] += 1
+                _seen_in_msg.add(resolved)
+
+    # Also re-scan commentary text for ambiguous tokens missed by primary pass
+    _comm_extra: list[str] = []
+    if commentary_ctx.get("has_content"):
+        _seen_comm: set[str] = set()
+        for match in _TITLE_RE_SPACED.finditer(commentary_ctx.get("all_text", "")):
+            raw_tok = match.group(1) + match.group(2)
+            if normalize_player_token(raw_tok) is not None:
+                continue
+            resolved = normalize_with_context(raw_tok, _ctx_resolved, _ctx_text)
+            if (resolved and resolved not in _NON_PLAYER_CANONICAL
+                    and resolved not in _ctx_resolved and resolved not in _seen_comm):
+                _comm_extra.append(resolved)
+                _seen_comm.add(resolved)
+
+    # Merge context-resolved additions (lower confidence → lower sort weight)
+    _ctx_already = {n for n in comm_players} | {n for n, _ in chat_player_cands}
+    comm_players  = comm_players + [n for n in _comm_extra if n not in _ctx_already]
+    chat_player_cands = (
+        chat_player_cands
+        + [(n, cnt) for n, cnt in _ctx_extra.items() if n not in _ctx_already]
+    )
+
     comm_player_set = set(comm_players)
     player_cands = (
         [(name, 99) for name in comm_players] +
         [(name, cnt) for name, cnt in chat_player_cands if name not in comm_player_set]
     )
 
-    # primary_player = the single most authoritative subject of the scene
-    primary_player: str | None = comm_players[0] if comm_players else (
-        chat_player_cands[0][0] if chat_player_cands else None
+    # primary_player — validated roster-backed selection (not naive first-occurrence)
+    # _select_primary_player validates every candidate against the official roster
+    # and prefers corroborated evidence (commentary + chat) over first-appearance.
+    primary_player: str | None = _select_primary_player(
+        comm_players, chat_player_cands, peak_msgs
     )
 
     # ── Combined narrative ────────────────────────────────────────────────────
@@ -1741,13 +2583,34 @@ def build_player_analysis(
     for m in text_msgs:
         text = m.get("text", "") or ""
         ts   = m["timestamp_seconds"]
+        seen_canonical: set[str] = set()   # one timestamp per player per message
+
+        # ── Title/social-suffix pattern (e.g. 공태현선수, 한백형, 한백햄) ────
+        # All routed through normalize_player_token — roster-anchored.
         for match in _TITLE_RE.finditer(text):
-            name = match.group(1)
-            if name in _KR_STOPWORDS:
-                continue
-            raw       = name + match.group(2)
-            canonical = resolve_canonical(raw)   # merge aliases → one identity
-            mention_times.setdefault(canonical, []).append(ts)
+            canonical = normalize_player_token(match.group(1) + match.group(2))
+            if (canonical and canonical not in _NON_PLAYER_CANONICAL
+                    and canonical not in seen_canonical):
+                mention_times.setdefault(canonical, []).append(ts)
+                seen_canonical.add(canonical)
+
+        # ── Short-name alias (e.g. 공프로, 최프로) — single-syllable surname ─
+        for match in _SHORT_PLAYER_RE.finditer(text):
+            canonical = normalize_player_token(match.group(1) + match.group(2))
+            if (canonical and canonical not in _NON_PLAYER_CANONICAL
+                    and canonical not in seen_canonical):
+                mention_times.setdefault(canonical, []).append(ts)
+                seen_canonical.add(canonical)
+
+        # ── Bare official-name scanning (e.g. "공태현 역시 대단") ─────────────
+        if _OFFICIAL_BARE_NAMES:
+            for bare in _OFFICIAL_BARE_NAMES:
+                if bare in text:
+                    canonical = resolve_canonical(bare)
+                    if (canonical not in _NON_PLAYER_CANONICAL
+                            and canonical not in seen_canonical):
+                        mention_times.setdefault(canonical, []).append(ts)
+                        seen_canonical.add(canonical)
 
     if not mention_times:
         return []
@@ -1843,6 +2706,11 @@ def build_player_analysis(
             "opportunity_score": None,   # filled after normalisation
         })
 
+    # Remove non-player entities (channel hosts, guest participants).
+    # These appear in the chat by mention but must not pollute player analytics,
+    # discovery scoring, or spike entity attribution.
+    raw = [p for p in raw if p["name"] not in _NON_PLAYER_CANONICAL]
+
     # Sort by mention count (main ranking)
     raw.sort(key=lambda x: x["mention_count"], reverse=True)
 
@@ -1850,19 +2718,28 @@ def build_player_analysis(
     for rank, spike in enumerate(spike_moments, 1):
         ws = float(spike.get("window_start", 0))
         we = float(spike.get("window_end",   0))
-        spike_players: set[str] = set()
+        spike_canonical: set[str] = set()
         for m in text_msgs:
             if not (ws <= m["timestamp_seconds"] <= we):
                 continue
             text = m.get("text", "") or ""
+            # Route through normalize_player_token for roster-backed resolution
             for match in _TITLE_RE.finditer(text):
-                name = match.group(1)
-                if name in _KR_STOPWORDS:
-                    continue
-                spike_players.add(name + match.group(2))
-        spike_players_canonical = {resolve_canonical(n) for n in spike_players}
+                can = normalize_player_token(match.group(1) + match.group(2))
+                if can and can not in _NON_PLAYER_CANONICAL:
+                    spike_canonical.add(can)
+            for match in _SHORT_PLAYER_RE.finditer(text):
+                can = normalize_player_token(match.group(1) + match.group(2))
+                if can and can not in _NON_PLAYER_CANONICAL:
+                    spike_canonical.add(can)
+            if _OFFICIAL_BARE_NAMES:
+                for bare in _OFFICIAL_BARE_NAMES:
+                    if bare in text:
+                        can = resolve_canonical(bare)
+                        if can not in _NON_PLAYER_CANONICAL:
+                            spike_canonical.add(can)
         for p in raw:
-            if p["name"] in spike_players_canonical and rank not in p["spike_ranks"]:
+            if p["name"] in spike_canonical and rank not in p["spike_ranks"]:
                 p["spike_ranks"].append(rank)
 
     for p in raw:
@@ -2084,9 +2961,218 @@ def side_by_side_chat(
     return outer
 
 
+# ── Discovery player narrative builder ───────────────────────────────────────
+
+def _build_discovery_narrative(
+    player: dict,
+    spike_moments: list[dict],
+    text_msgs: list[dict],
+) -> dict:
+    """
+    Build a structured 4-part narrative for a discovery/opportunity player card.
+
+    Returns a dict with keys:
+        context        — match situation that drove attention
+        reaction_text  — audience chat evidence and tone description
+        interpretation — whether this looks like a spike-and-drop or fandom seed
+        content_action — specific content recommendation grounded in the evidence
+
+    The narrative is data-driven: it pulls from the player's actual spike_ranks,
+    the enriched spike data (commentary + chat), and the player's mention timeline.
+    """
+    name        = player["name"]
+    spike_ranks = player.get("spike_ranks", [])
+    sentiment   = player.get("sentiment", "복합적")
+    pos_ratio   = player.get("pos_ratio", 0.0)
+    rx_per_ev   = player.get("rx_per_event", 0.0)
+    mention_cnt = player.get("mention_count", 0)
+    top_rx      = player.get("top_reactions", [])
+    mention_evs = player.get("mention_events", 0)
+
+    # ── 1. CONTEXT: Collect spike evidence for this player ──────────────────
+    spike_contexts: list[str] = []
+    spike_chat_samples: list[dict] = []
+
+    for rank in spike_ranks[:3]:
+        idx = rank - 1
+        if idx < 0 or idx >= len(spike_moments):
+            continue
+        sp       = spike_moments[idx]
+        enriched = sp.get("enriched", {})
+        anchor   = float(sp.get("anchor_time", 0))
+        ts_str   = fmt_seconds(anchor)
+
+        # Commentary context
+        comm_ctx  = enriched.get("commentary_ctx", {})
+        pre_text  = (comm_ctx.get("pre_text") or "").strip()
+        conc_text = (comm_ctx.get("concurrent_text") or "").strip()
+        best_comm = pre_text or conc_text
+
+        # Event information
+        ev_mentions = enriched.get("event_mentions", [])
+        top_ev      = ev_mentions[0][0] if ev_mentions else None
+
+        # Build context line for this spike
+        if best_comm:
+            snippet = best_comm[:80].rstrip()
+            if not snippet.endswith(("다", "요", ".", "。")):
+                snippet += "..."
+            ctx_line = f"스파이크 #{rank} ({ts_str}): 해설 「{snippet}」"
+            if top_ev:
+                ctx_line += f" → {top_ev} 장면"
+        elif top_ev:
+            ctx_line = f"스파이크 #{rank} ({ts_str}): {name} 관련 {top_ev} 장면"
+        else:
+            ctx_line = f"스파이크 #{rank} ({ts_str}): {name} 관련 채팅 집중 구간"
+        spike_contexts.append(ctx_line)
+
+        # Pull chat messages that specifically mention this player by name
+        ws = float(sp.get("window_start", 0))
+        we = float(sp.get("window_end", 0))
+        buildup_start = max(0.0, ws - 60.0)
+        bare_name = name.replace(" 프로", "").replace(" 선수", "")
+        aliases_for_player = [
+            alias for alias, canonical in PLAYER_ALIASES.items()
+            if canonical == name
+        ]
+        search_terms = {bare_name} | set(aliases_for_player)
+        for m in text_msgs:
+            mts = m.get("timestamp_seconds", 0)
+            if not (buildup_start <= mts <= we):
+                continue
+            txt = m.get("text", "") or ""
+            if any(term in txt for term in search_terms):
+                spike_chat_samples.append(m)
+
+    # Deduplicate chat samples
+    seen_txt: set = set()
+    deduped_samples: list[dict] = []
+    for m in spike_chat_samples:
+        t = (m.get("text", "") or "").strip()
+        if t and t not in seen_txt and len(t) > 3:
+            seen_txt.add(t)
+            deduped_samples.append(m)
+
+    # ── 2. REACTION: Tone analysis across all player mentions ────────────────
+    # Categorise messages that mention this player by name across the whole stream
+    bare_name = name.replace(" 프로", "").replace(" 선수", "")
+    aliases_for_player = [
+        alias for alias, canonical in PLAYER_ALIASES.items()
+        if canonical == name
+    ]
+    search_terms = {bare_name} | set(aliases_for_player)
+
+    # Classify into narrative tone categories based on message content
+    discovery_signals  = []   # "다크호스", "누구야", "처음봤", "신인"
+    admiration_signals = []   # "ㄷㄷ", "대박", "장타", "이글", "버디"
+    regional_signals   = []   # regional pride ("광주", "부산", etc.)
+    sustained_signals  = []   # messages from later in the stream ("앞으로", "기억")
+
+    _DISCOVERY_WORDS  = {"다크호스", "몰랐", "누구", "처음", "신인", "신인왕", "루키"}
+    _ADMIRATION_WORDS = {"ㄷ", "대박", "장타", "이글", "버디", "홀인원", "기대", "잘한다", "잘하네"}
+    _SUSTAINED_WORDS  = {"앞으로", "기억", "기대되네", "계속", "주목", "팬"}
+
+    all_name_msgs = [
+        m for m in text_msgs
+        if any(term in (m.get("text") or "") for term in search_terms)
+    ]
+    all_name_msgs.sort(key=lambda x: x.get("timestamp_seconds", 0))
+    max_ts = max((m.get("timestamp_seconds", 0) for m in all_name_msgs), default=0)
+
+    for m in all_name_msgs:
+        txt  = (m.get("text") or "").lower()
+        mts  = m.get("timestamp_seconds", 0)
+        late = (mts > max_ts * 0.75)   # last 25% of the stream = "sustained"
+        if any(w in txt for w in _DISCOVERY_WORDS):
+            discovery_signals.append(m)
+        if any(w in txt for w in _ADMIRATION_WORDS):
+            admiration_signals.append(m)
+        if late and any(w in txt for w in _SUSTAINED_WORDS):
+            sustained_signals.append(m)
+
+    # ── 3. INTERPRETATION: Spike-and-drop vs. fandom conversion ─────────────
+    cluster_count   = mention_evs
+    has_late_signal = bool(sustained_signals)
+    is_multi_spike  = len(spike_ranks) >= 2
+
+    if has_late_signal and is_multi_spike:
+        interpretation = (
+            f"{mention_cnt}회의 언급이 방송 초반부터 종반까지 분산되어 있고, "
+            f"종반부에도 '{sustained_signals[0].get('text','')[:25]}' 같은 "
+            "지속적인 관심 신호가 관측됩니다. "
+            "이는 단발성 스파이크가 아닌 팬덤 전환 초기 신호로 해석할 수 있습니다."
+        )
+    elif is_multi_spike and cluster_count >= 2:
+        interpretation = (
+            f"총 {cluster_count}개의 독립적 언급 클러스터에 걸쳐 반응이 분산되어 있습니다. "
+            "한 번 이상 시청자 집단 기억에 등록된 선수로, "
+            "추가 노출 시 팬층 전환 가능성이 있는 단계입니다."
+        )
+    else:
+        interpretation = (
+            f"이번 방송에서 {mention_cnt}회 언급됐으며, "
+            f"주요 반응 감성은 {sentiment}입니다. "
+            "현재는 관심 선수 단계이며, 추가 방송 출연을 통해 팬덤 전환 여부 확인이 권장됩니다."
+        )
+
+    # ── 4. CONTENT ACTION: Format-specific recommendation ────────────────────
+    top_rx_label = top_rx[0][0] if top_rx else None
+    spike_ref    = f" (스파이크 #{spike_ranks[0]} 연계)" if spike_ranks else ""
+    disc_count   = len(discovery_signals)
+    adm_count    = len(admiration_signals)
+
+    if sentiment in ("감탄·대박", "놀람·흥분") or adm_count >= 3:
+        content_action = (
+            f"① 기술·샷 하이라이트 숏츠{spike_ref}: 시청자가 '대박·장타·이글' 등 "
+            "기술 감탄 반응을 보인 장면을 단독 클립으로 편집. "
+            "'이 선수의 이 샷' 단독 포맷 추천.\n"
+            f"② 선수 소개 카드: 시청자 스스로 '{bare_name}' 이름을 검색할 수 있도록 "
+            "이름 + 배경(신인왕·출신지 등) 자막 삽입."
+        )
+    elif disc_count >= 2:
+        content_action = (
+            f"① 발굴 스토리 숏츠{spike_ref}: 채팅에서 '다크호스·신인왕' 등 "
+            "발견 내러티브가 형성됐습니다. "
+            "'숨은 고수를 찾아라' 스타일의 편집 포맷이 유효합니다.\n"
+            "② 인트로 클립: 첫 등장 시 이름 + 경력 자막을 강조하여 "
+            "아직 모르는 시청자에게 맥락을 제공하는 편집."
+        )
+    elif sentiment == "응원·격려":
+        content_action = (
+            f"① 내러티브 성장 숏츠{spike_ref}: 응원 감성이 지배적입니다. "
+            "'좋아질 선수' 스토리텔링 포맷으로 팬층 확대에 활용.\n"
+            "② 팬 리액션 오버레이: 응원 채팅을 화면에 표시하여 "
+            "커뮤니티 소속감을 자극하는 편집."
+        )
+    else:
+        content_action = (
+            f"① 종합 하이라이트 비중 확대{spike_ref}: "
+            "다양한 반응 패턴이 관측됩니다. 여러 포맷(숏츠·하이라이트·인트로)을 "
+            "병행 테스트하여 어느 포맷에서 반응률이 높은지 확인.\n"
+            "② 이름 노출 빈도 증가: 자막·타이틀에 이름을 의식적으로 포함시켜 "
+            "검색 유입 가능성을 높임."
+        )
+
+    return {
+        "context":        spike_contexts,
+        "chat_samples":   deduped_samples[:6],
+        "reaction_text":  (
+            f"총 {mention_cnt}회 언급 · {cluster_count}개 시간 클러스터 · "
+            f"긍정 비율 {int(pos_ratio*100)}% · 이벤트당 반응 {rx_per_ev:.1f}건\n"
+            f"주요 반응 유형: " +
+            ("  ·  ".join(f"{cat}({cnt})" for cat, cnt in top_rx[:3]) if top_rx else "—")
+        ),
+        "discovery_msgs": discovery_signals[:3],
+        "admiration_msgs": admiration_signals[:3],
+        "sustained_msgs": sustained_signals[:2],
+        "interpretation": interpretation,
+        "content_action": content_action,
+    }
+
+
 # ── Story builder ─────────────────────────────────────────────────────────────
 
-def build_story(d: dict) -> list:
+def build_story(d: dict, is_summary: bool = False) -> list:
     story = []
     P = Paragraph
 
@@ -2152,7 +3238,7 @@ def build_story(d: dict) -> list:
             # Trim to one sentence for cover
             summary = summary.split("—")[0].split("\n")[0].strip()
             lines.append(f"{i}위  {ts}  ({cnt}개)  {summary}")
-        story.append(callout("\n".join(lines), ORANGE))
+        story.append(callout("<br/>".join(lines), ORANGE))
     else:
         story.append(callout("스파이크 데이터가 없습니다. highlight_pipeline.py를 먼저 실행하십시오."))
 
@@ -2447,19 +3533,21 @@ def build_story(d: dict) -> list:
             right_label = f"이벤트 반응 채팅  [{ev_cnt}개]",
             left_accent  = BLUE,
             right_accent = ORANGE,
+            max_each    = 3 if is_summary else 5,
         ))
 
         # ── Chat-internal layer — compact horizontal rows ─────────────────────
         if peak_internal:
             block.append(vspace(1.5))
             # Deduplicate
+            _chat_limit = 3 if is_summary else 5
             seen_i, shown_i = set(), []
             for m in peak_internal:
                 t = m.get("text", "").strip()
                 if t and t not in seen_i:
                     seen_i.add(t)
                     shown_i.append(m)
-                if len(shown_i) >= 5:
+                if len(shown_i) >= _chat_limit:
                     break
 
             hdr_s = ParagraphStyle(
@@ -2509,10 +3597,10 @@ def build_story(d: dict) -> list:
         story.extend(block[8:])
 
     # ═══════════════════════════════════════════════════════════════
-    # SECTION 3-S — Marketing Opportunity Players
+    # SECTION 3-S — Marketing Opportunity Players  (full report only)
     # ═══════════════════════════════════════════════════════════════
     _pa = d.get("player_analysis", [])
-    if _pa:
+    if _pa and not is_summary:
         story.append(PageBreak())
         story.extend(section_heading("3-S.  마케팅 기회 선수 — 스포트라이트 확대 후보"))
         story.append(P(
@@ -2640,6 +3728,22 @@ def build_story(d: dict) -> list:
                                    leading=11, textColor=GREY,
                                    alignment=TA_CENTER, wordWrap="CJK")
 
+            # Retrieve spike moments and messages for discovery narrative
+            _spike_moms = d.get("spike_moments", [])
+            _text_msgs  = [m for m in d.get("messages", [])
+                           if m.get("message_type", "text") == "text"]
+
+            _disc_label_s = ParagraphStyle(
+                "_dlbl", fontName="KR-Bold", fontSize=8.5, leading=13,
+                textColor=BLUE, spaceBefore=4, spaceAfter=1, wordWrap="CJK")
+            _disc_body_s = ParagraphStyle(
+                "_dbdy", fontName="KR", fontSize=8.5, leading=14,
+                textColor=BLACK, wordWrap="CJK", spaceAfter=2,
+                alignment=TA_JUSTIFY)
+            _disc_chat_s = ParagraphStyle(
+                "_dchat", fontName="KR", fontSize=7.5, leading=12,
+                textColor=GREY, wordWrap="CJK", leftIndent=10)
+
             for _p in _opp_cands:
                 _obc = []
                 _sent_hex = _SENT_HEX.get(_p["sentiment"], "#64748B")
@@ -2690,13 +3794,69 @@ def build_story(d: dict) -> list:
                     STYLES["small"]
                 ))
                 _obc.append(P(f"스파이크 연계: {_sp_str}", STYLES["small"]))
-                _obc.append(vspace(1))
+                _obc.append(vspace(2))
 
-                _obc.append(callout(
-                    f"<b>기회 이유:</b>  {_mkt_reason(_p, _pa)}\n\n"
-                    f"<b>콘텐츠·마케팅 제안:</b>  {_mkt_suggestion(_p)}",
-                    GREEN
-                ))
+                # ── 4-part discovery narrative (context→reaction→interpretation→action)
+                _disc = _build_discovery_narrative(_p, _spike_moms, _text_msgs)
+
+                # CONTEXT
+                _obc.append(P("① 맥락 — 어떤 순간에 주목받았나", _disc_label_s))
+                if _disc["context"]:
+                    for _ctx_line in _disc["context"]:
+                        _obc.append(P("• " + _ctx_line, _disc_body_s))
+                else:
+                    _obc.append(P("스파이크 연계 해설 맥락 없음 — 채팅 텍스트 기반 추론",
+                                  _disc_body_s))
+                # Show up to 4 chat messages that mention the player
+                if _disc["chat_samples"]:
+                    _obc.append(P("관련 채팅 샘플:", ParagraphStyle(
+                        "_csamp", fontName="KR", fontSize=7.5, leading=11,
+                        textColor=GREY, spaceBefore=2)))
+                    for _cm in _disc["chat_samples"][:4]:
+                        _ts  = fmt_seconds(_cm.get("timestamp_seconds", 0))
+                        _au  = safe_str(_cm.get("author", ""))[:14]
+                        _tx  = safe_str(_cm.get("text", ""))[:60]
+                        _obc.append(P(f"  [{_ts}] {_au}: {_tx}", _disc_chat_s))
+                _obc.append(vspace(2))
+
+                # AUDIENCE REACTION
+                _obc.append(P("② 시청자 반응 — 어떻게 반응했나", _disc_label_s))
+                _obc.append(P(_disc["reaction_text"], _disc_body_s))
+                # Show discovery-framing messages if any
+                if _disc["discovery_msgs"]:
+                    _obc.append(P("발견·인식 반응:", ParagraphStyle(
+                        "_dsamp", fontName="KR", fontSize=7.5, leading=11,
+                        textColor=GREY, spaceBefore=1)))
+                    for _dm in _disc["discovery_msgs"][:2]:
+                        _ts  = fmt_seconds(_dm.get("timestamp_seconds", 0))
+                        _tx  = safe_str(_dm.get("text", ""))[:60]
+                        _obc.append(P(f"  [{_ts}] {_tx}", _disc_chat_s))
+                if _disc["admiration_msgs"]:
+                    _obc.append(P("감탄·기대 반응:", ParagraphStyle(
+                        "_asamp", fontName="KR", fontSize=7.5, leading=11,
+                        textColor=GREY, spaceBefore=1)))
+                    for _am in _disc["admiration_msgs"][:2]:
+                        _ts  = fmt_seconds(_am.get("timestamp_seconds", 0))
+                        _tx  = safe_str(_am.get("text", ""))[:60]
+                        _obc.append(P(f"  [{_ts}] {_tx}", _disc_chat_s))
+                if _disc["sustained_msgs"]:
+                    _obc.append(P("종반 지속 관심 신호:", ParagraphStyle(
+                        "_ssamp", fontName="KR", fontSize=7.5, leading=11,
+                        textColor=GREY, spaceBefore=1)))
+                    for _sm in _disc["sustained_msgs"][:2]:
+                        _ts  = fmt_seconds(_sm.get("timestamp_seconds", 0))
+                        _tx  = safe_str(_sm.get("text", ""))[:60]
+                        _obc.append(P(f"  [{_ts}] {_tx}", _disc_chat_s))
+                _obc.append(vspace(2))
+
+                # INTERPRETATION
+                _obc.append(P("③ 해석 — 단발 스파이크인가, 팬덤 전환 신호인가", _disc_label_s))
+                _obc.append(callout(_disc["interpretation"], GREEN))
+                _obc.append(vspace(2))
+
+                # CONTENT ACTION
+                _obc.append(P("④ 콘텐츠 행동 권고", _disc_label_s))
+                _obc.append(callout(_disc["content_action"], ORANGE))
                 _obc.append(vspace(4))
 
                 story.append(KeepTogether(_obc[:4]))
@@ -2707,96 +3867,88 @@ def build_story(d: dict) -> list:
             "섹션 8-B / 8-C를 참조하십시오."
         ))
 
-    story.append(PageBreak())
+    if not is_summary:
+        story.append(PageBreak())
 
-    # ═══════════════════════════════════════════════════════════════
-    # PAGE 5 — Keyword & Reaction Analysis
-    # ═══════════════════════════════════════════════════════════════
-    story.extend(section_heading("4.  스파이크 구간 키워드 분석"))
-    story.append(P(
-        "ㅋ+, ㅎ+, ㅠ+ 등 반복 패턴은 동일 반응으로 통합했습니다. "
-        "게임 이벤트 키워드(OB, 버디 등)는 별도 집계합니다.",
-        STYLES["body"]))
-    story.append(vspace(2))
-
-    kw_data = d["top_spike_keywords"]
-    if kw_data:
-        max_kw = kw_data[0][1]
-        story.append(bar_chart(kw_data[:12], max_kw, ORANGE, accent_idx=0))
-    story.append(vspace(4))
-
-    # Golf events
-    ev_data = d["top_spike_events"]
-    if ev_data:
-        story.extend(section_heading("5.  스파이크 구간 골프 이벤트"))
-        story.append(info_table(
-            ["이벤트", "언급 횟수"],
-            [(ev, str(cnt)) for ev, cnt in ev_data],
-            col_widths=[0.65, 0.35],
-        ))
-        story.append(vspace(4))
-
-    # Overall reaction profile
-    if d["overall_reaction_profile"]:
-        story.extend(section_heading("6.  전체 스파이크 반응 유형 합계"))
+        # ═══════════════════════════════════════════════════════════════
+        # PAGE 5 — Keyword & Reaction Analysis
+        # ═══════════════════════════════════════════════════════════════
+        story.extend(section_heading("4.  스파이크 구간 키워드 분석"))
         story.append(P(
-            "모든 스파이크 구간에서 감지된 반응 유형의 누적 합계입니다. "
-            "어떤 감정이 이 영상 전체에서 가장 많이 표출됐는지를 보여줍니다.",
+            "ㅋ+, ㅎ+, ㅠ+ 등 반복 패턴은 동일 반응으로 통합했습니다. "
+            "게임 이벤트 키워드(OB, 버디 등)는 별도 집계합니다.",
             STYLES["body"]))
         story.append(vspace(2))
-        max_rc = d["overall_reaction_profile"][0][1]
-        story.append(bar_chart(
-            [(cat, cnt) for cat, cnt in d["overall_reaction_profile"]],
-            max_rc, GREEN, accent_idx=0
+
+        kw_data = d["top_spike_keywords"]
+        if kw_data:
+            max_kw = kw_data[0][1]
+            story.append(bar_chart(kw_data[:12], max_kw, ORANGE, accent_idx=0))
+        story.append(vspace(4))
+
+        # Golf events
+        ev_data = d["top_spike_events"]
+        if ev_data:
+            story.extend(section_heading("5.  스파이크 구간 골프 이벤트"))
+            story.append(info_table(
+                ["이벤트", "언급 횟수"],
+                [(ev, str(cnt)) for ev, cnt in ev_data],
+                col_widths=[0.65, 0.35],
+            ))
+            story.append(vspace(4))
+
+        # Overall reaction profile
+        if d["overall_reaction_profile"]:
+            story.extend(section_heading("6.  전체 스파이크 반응 유형 합계"))
+            story.append(P(
+                "모든 스파이크 구간에서 감지된 반응 유형의 누적 합계입니다. "
+                "어떤 감정이 이 영상 전체에서 가장 많이 표출됐는지를 보여줍니다.",
+                STYLES["body"]))
+            story.append(vspace(2))
+            max_rc = d["overall_reaction_profile"][0][1]
+            story.append(bar_chart(
+                [(cat, cnt) for cat, cnt in d["overall_reaction_profile"]],
+                max_rc, GREEN, accent_idx=0
+            ))
+            story.append(vspace(4))
+
+        story.append(PageBreak())
+
+        # ═══════════════════════════════════════════════════════════════
+        # PAGE 6 — Shorts & Title Recommendations
+        # ═══════════════════════════════════════════════════════════════
+        story.extend(section_heading("7.  Shorts & 제목 추천"))
+
+        if d["title_suggestions"]:
+            story.append(P("추천 제목 후보", STYLES["h3"]))
+            for t in d["title_suggestions"]:
+                story.append(bullet(safe_str(t)))
+            story.append(vspace(4))
+
+        if d["shorts_sequences"]:
+            story.append(P("Shorts 시퀀스 기획안", STYLES["h3"]))
+            rows = []
+            for s in d["shorts_sequences"]:
+                dur = safe_str(s.get("estimated_duration_sec", ""))
+                rows.append([
+                    safe_str(s.get("title", "")),
+                    safe_str(s.get("description", "")),
+                    (dur + "초") if dur != "—" else "—",
+                ])
+            story.append(info_table(["제목", "설명", "예상 길이"], rows,
+                                    col_widths=[0.30, 0.55, 0.15]))
+            story.append(vspace(4))
+
+        story.append(note_box(
+            "스파이크 기반 Shorts 후보는 메시지 밀집도로 선정됩니다. "
+            "최종 편집 여부는 영상을 직접 확인하십시오."
         ))
-        story.append(vspace(4))
-
-    story.append(PageBreak())
-
-    # ═══════════════════════════════════════════════════════════════
-    # PAGE 6 — Shorts & Title Recommendations
-    # ═══════════════════════════════════════════════════════════════
-    story.extend(section_heading("7.  Shorts & 제목 추천"))
-
-    if d["title_suggestions"]:
-        story.append(P("추천 제목 후보", STYLES["h3"]))
-        for t in d["title_suggestions"]:
-            story.append(bullet(safe_str(t)))
-        story.append(vspace(4))
-
-    if d["shorts_sequences"]:
-        story.append(P("Shorts 시퀀스 기획안", STYLES["h3"]))
-        rows = []
-        for s in d["shorts_sequences"]:
-            dur = safe_str(s.get("estimated_duration_sec", ""))
-            rows.append([
-                safe_str(s.get("title", "")),
-                safe_str(s.get("description", "")),
-                (dur + "초") if dur != "—" else "—",
-            ])
-        story.append(info_table(["제목", "설명", "예상 길이"], rows,
-                                col_widths=[0.30, 0.55, 0.15]))
-        story.append(vspace(4))
-
-    story.append(note_box(
-        "스파이크 기반 Shorts 후보는 메시지 밀집도로 선정됩니다. "
-        "최종 편집 여부는 영상을 직접 확인하십시오."
-    ))
-    story.append(PageBreak())
+        story.append(PageBreak())
 
     # ═══════════════════════════════════════════════════════════════
     # PAGES — Player-centred Analysis  (independent of spike detection)
     # ═══════════════════════════════════════════════════════════════
     player_list = d.get("player_analysis", [])
-
-    story.extend(section_heading("8.  선수별 시청자 반응 분석"))
-    story.append(P(
-        "스파이크 분석과 독립적인 <b>선수 중심 분석</b>입니다.  "
-        "채팅 전체에서 '이름+호칭(프로/선수/형/님)' 패턴으로 선수를 추출하고, "
-        "각 언급 시점 전후 ±30초 창의 반응을 해당 선수에게 귀속시킵니다.  "
-        "이 방식은 같은 메시지에 이름과 반응이 함께 있지 않아도 반응을 포착합니다.",
-        STYLES["body"]))
-    story.append(vspace(3))
 
     if not player_list:
         story.append(note_box(
@@ -2806,12 +3958,13 @@ def build_story(d: dict) -> list:
         story.append(PageBreak())
     else:
         # ── 8-A. Dual-bar overview: mentions + reaction volume ────────────────
-        story.extend(section_heading("8-A.  언급 횟수 및 반응량 순위"))
-        story.append(P(
-            "왼쪽: 전체 채팅에서의 언급 횟수 (인지도 지표).  "
-            "오른쪽: 해당 선수가 언급된 시간대에서 수집된 총 반응 수 (시청자 에너지 지표).",
-            STYLES["body"]))
-        story.append(vspace(2))
+        if not is_summary:
+            story.extend(section_heading("8-A.  언급 횟수 및 반응량 순위"))
+            story.append(P(
+                "왼쪽: 전체 채팅에서의 언급 횟수 (인지도 지표).  "
+                "오른쪽: 해당 선수가 언급된 시간대에서 수집된 총 반응 수 (시청자 에너지 지표).",
+                STYLES["body"]))
+            story.append(vspace(2))
 
         top10 = player_list[:10]
         fw    = PW - 2 * M
@@ -2881,200 +4034,344 @@ def build_story(d: dict) -> list:
             ("RIGHTPADDING",  (0, 0), (-1, -1), 3),
             ("GRID",          (0, 0), (-1, -1), 0.3, SLATE_MID),
         ]))
-        story.append(dual_tbl)
-        story.append(vspace(2))
-        story.append(note_box(
-            "언급 횟수 = 채팅에서 해당 선수 이름+호칭이 등장한 횟수 (인지도).  "
-            "반응량 = 언급 전후 ±30초 창에서 집계된 감탄·웃음·탄성 등 반응 토큰 수 (흥미도).  "
-            "두 지표 간 격차가 클수록 '언급 대비 반응이 강한' 또는 '반응 대비 언급이 적은' 선수입니다."
-        ))
-        story.append(PageBreak())
-
-        # ── 8-B. Per-player reaction profile cards ────────────────────────────
-        story.extend(section_heading("8-B.  선수별 반응 프로파일"))
-        story.append(P(
-            "각 선수에 대해: 반응 유형 분포 / 감성 프로파일 / 반응 집중도 / 스파이크 연계.",
-            STYLES["body"]))
-        story.append(vspace(3))
-
-        # Sentiment → color mapping
-        _SENT_COLOR = {
-            "유머·재미":   colors.HexColor("#F59E0B"),
-            "놀람·흥분":   colors.HexColor("#7C3AED"),
-            "감탄·대박":   colors.HexColor("#059669"),
-            "응원·격려":   GREEN,
-            "안타까움":    RED,
-            "긴장·충격":   ORANGE,
-            "긴장감":      ORANGE,
-            "긍정적":      GREEN,
-            "복합적":      GREY,
-        }
-
-        for i, p in enumerate(player_list[:10]):
-            name      = p["name"]
-            mc        = p["mention_count"]
-            events    = p["mention_events"]
-            total_rx  = p["total_rx"]
-            rpe       = p["rx_per_event"]
-            pos_r     = p["pos_ratio"]
-            sent      = p["sentiment"]
-            top_rx    = p["top_reactions"]
-            spikes    = p["spike_ranks"]
-            opp       = p["opportunity_score"]
-
-            accent      = ORANGE if i == 0 else BLUE
-            sent_color  = _SENT_COLOR.get(sent, GREY)
-
-            block = []
-
-            # Header line
-            rank_star = "★ " if i < 3 else ""
-            block.append(P(
-                f"{rank_star}{i+1}.  {name}",
-                ParagraphStyle("_ph", fontName="KR-Bold", fontSize=10, leading=15,
-                               textColor=accent, spaceBefore=6)
-            ))
-            block.append(rule(accent, 0.8))
-
-            # Stat row: 4-cell mini table
-            def _stat_cell(label, val, color=BLACK):
-                return Table(
-                    [[Paragraph(str(val), ParagraphStyle(
-                          "_sv", fontName="KR-Bold", fontSize=11, leading=15,
-                          textColor=color, alignment=TA_CENTER))],
-                     [Paragraph(label, ParagraphStyle(
-                          "_sl", fontName="KR", fontSize=7.5, leading=11,
-                          textColor=GREY, alignment=TA_CENTER, wordWrap="CJK"))]],
-                    colWidths=[fw / 5],
-                    rowHeights=[14 * mm, 8 * mm],
-                )
-
-            pos_pct = f"{int(pos_r * 100)}%"
-            opp_str = str(opp) if opp is not None else "—"
-            stat_cells = [
-                _stat_cell("언급 횟수", mc, BLUE),
-                _stat_cell("등장 이벤트", events, SLATE),
-                _stat_cell("총 반응량", total_rx, ORANGE),
-                _stat_cell("이벤트당 반응", f"{rpe:.1f}", GREEN),
-                _stat_cell("긍정 비율", pos_pct, sent_color),
-            ]
-            stat_row_tbl = Table([stat_cells], colWidths=[fw / 5] * 5)
-            stat_row_tbl.setStyle(TableStyle([
-                ("BACKGROUND", (0, 0), (-1, -1), BLUE_LIGHT),
-                ("GRID",       (0, 0), (-1, -1), 0.4, BLUE_MID),
-                ("VALIGN",     (0, 0), (-1, -1), "MIDDLE"),
-                ("TOPPADDING",    (0, 0), (-1, -1), 3),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
-            ]))
-            block.append(stat_row_tbl)
-            block.append(vspace(2))
-
-            # Reaction type breakdown (horizontal pill table, up to 5 types)
-            if top_rx:
-                rx_cols = min(len(top_rx), 5)
-                cw      = fw / rx_cols
-                n_row, l_row = [], []
-                for cat, cnt in top_rx[:rx_cols]:
-                    n_row.append(Paragraph(str(cnt), ParagraphStyle(
-                        "_rxn", fontName="KR-Bold", fontSize=9, textColor=ORANGE,
-                        alignment=TA_CENTER, leading=13)))
-                    l_row.append(Paragraph(cat, ParagraphStyle(
-                        "_rxl", fontName="KR", fontSize=7.5, textColor=GREY,
-                        alignment=TA_CENTER, leading=11, wordWrap="CJK")))
-                rx_t = Table([n_row, l_row], colWidths=[cw] * rx_cols,
-                             rowHeights=[11 * mm, 8 * mm])
-                rx_t.setStyle(TableStyle([
-                    ("BACKGROUND",    (0, 0), (-1, 0), colors.HexColor("#FFF7ED")),
-                    ("BACKGROUND",    (0, 1), (-1, 1), SLATE_LIGHT),
-                    ("ALIGN",         (0, 0), (-1, -1), "CENTER"),
-                    ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
-                    ("GRID",          (0, 0), (-1, -1), 0.4, SLATE_MID),
-                    ("TOPPADDING",    (0, 0), (-1, -1), 2),
-                    ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
-                ]))
-                block.append(P("반응 유형 분포:", STYLES["small"]))
-                block.append(rx_t)
-                block.append(vspace(1))
-
-            # Sentiment + spike tags
-            spike_str = (
-                "  ·  스파이크 연계: " + ", ".join(f"#{r}위" for r in spikes)
-                if spikes else ""
-            )
-            opp_str2  = (f"  ·  기회 점수: {opp}/100" if opp is not None else "")
-            block.append(P(
-                f"감성 프로파일: <b>{sent}</b>{spike_str}{opp_str2}",
-                ParagraphStyle("_pi2", fontName="KR", fontSize=8, leading=13,
-                               textColor=GREY, wordWrap="CJK")
-            ))
-            block.append(vspace(4))
-
-            story.append(KeepTogether(block[:4]))
-            story.extend(block[4:])
-
-        story.append(PageBreak())
-
-        # ── 8-C. Opportunity table ────────────────────────────────────────────
-        story.extend(section_heading("8-C.  발굴 기회 분석 — 저인지·고반응 선수"))
-        story.append(P(
-            "<b>기회 점수(Opportunity Score)</b>는 '언급량은 적지만 등장할 때마다 강하고 "
-            "긍정적인 시청자 반응을 이끌어내는' 선수를 찾기 위한 지표입니다.  "
-            "이런 선수는 콘텐츠 노출을 늘렸을 때 시청자 반응이 빠르게 성장할 가능성이 있습니다.",
-            STYLES["body"]))
-        story.append(vspace(2))
-
-        # Score definition callout
-        story.append(callout(
-            "기회 점수 = (이벤트당 반응 수) × (0.4 + 0.6 × 긍정 비율)  →  0–100 정규화\n"
-            "높은 점수: 등장 빈도는 낮아도 시청자가 즉각·긍정적으로 반응하는 선수\n"
-            "낮은 점수: 자주 언급되지만 반응 강도·긍정성이 평균 이하인 선수",
-            BLUE
-        ))
-        story.append(vspace(3))
-
-        # Eligible players: ≥ 2 mention events, has opportunity score
-        eligible_opp = [
-            p for p in player_list
-            if p["opportunity_score"] is not None
-        ]
-        eligible_opp.sort(key=lambda x: x["opportunity_score"], reverse=True)
-
-        if eligible_opp:
-            rows_opp = []
-            median_mc = sorted(p["mention_count"] for p in eligible_opp)[len(eligible_opp) // 2]
-            for p in eligible_opp:
-                flag = "★" if p["mention_count"] <= median_mc else ""
-                rows_opp.append([
-                    flag + p["name"],
-                    str(p["mention_count"]),
-                    str(p["total_rx"]),
-                    f"{p['rx_per_event']:.1f}",
-                    f"{int(p['pos_ratio'] * 100)}%",
-                    p["sentiment"],
-                    str(p["opportunity_score"]),
-                ])
-            story.append(info_table(
-                ["선수", "언급수", "반응량", "이벤트당\n반응", "긍정\n비율", "감성", "기회\n점수"],
-                rows_opp,
-                col_widths=[0.24, 0.09, 0.09, 0.10, 0.09, 0.17, 0.10],
-            ))
+        if not is_summary:
+            story.append(dual_tbl)
             story.append(vspace(2))
             story.append(note_box(
-                "★ 표시 = 데이터셋 내 중앙값 이하 언급 횟수 (저인지 후보).  "
-                "기회 점수 상위 + ★ 조합이 '발굴 우선 검토' 선수입니다.  "
-                "최소 2회 이상 언급 이벤트가 있는 선수만 포함됩니다."
+                "언급 횟수 = 채팅에서 해당 선수 이름+호칭이 등장한 횟수 (인지도).  "
+                "반응량 = 언급 전후 ±30초 창에서 집계된 감탄·웃음·탄성 등 반응 토큰 수 (흥미도).  "
+                "두 지표 간 격차가 클수록 '언급 대비 반응이 강한' 또는 '반응 대비 언급이 적은' 선수입니다."
             ))
-        else:
-            story.append(note_box(
-                "기회 점수를 계산할 수 있는 선수가 없습니다 "
-                "(언급 이벤트 2회 미만). 더 긴 영상이나 더 많은 채팅 데이터가 필요합니다."
+            story.append(PageBreak())
+
+        # ── 8-B. Per-player reaction profile cards (compact) ─────────────────
+        _sec8b_title = "4.  선수별 반응 프로파일" if is_summary else "8-B.  선수별 반응 프로파일"
+        story.extend(section_heading(_sec8b_title))
+        story.append(vspace(1))
+
+        # Sentiment → accent color
+        _SENT_COLOR = {
+            "유머·재미":  colors.HexColor("#F59E0B"),
+            "놀람·흥분":  colors.HexColor("#7C3AED"),
+            "감탄·대박":  colors.HexColor("#059669"),
+            "응원·격려":  GREEN,
+            "안타까움":   RED,
+            "긴장·충격":  ORANGE,
+            "긴장감":     ORANGE,
+            "긍정적":     GREEN,
+            "복합적":     GREY,
+        }
+
+        # Compact text styles reused across all cards
+        _hn_s = ParagraphStyle("_chn", fontName="KR-Bold", fontSize=9.5,
+                               leading=13, textColor=WHITE, wordWrap="CJK")
+        _st_s = ParagraphStyle("_cst", fontName="KR-Bold", fontSize=9,
+                               leading=12, textColor=BLACK,
+                               alignment=TA_CENTER, wordWrap="CJK")
+        _lb_s = ParagraphStyle("_clb", fontName="KR", fontSize=7,
+                               leading=10, textColor=GREY,
+                               alignment=TA_CENTER, wordWrap="CJK")
+        _rx_s = ParagraphStyle("_crx", fontName="KR", fontSize=7.5,
+                               leading=11, textColor=BLACK, wordWrap="CJK")
+
+        _8b_limit = 5 if is_summary else 10
+        for i, p in enumerate(player_list[:_8b_limit]):
+            name     = p["name"]
+            mc       = p["mention_count"]
+            events   = p["mention_events"]
+            total_rx = p["total_rx"]
+            rpe      = p["rx_per_event"]
+            pos_r    = p["pos_ratio"]
+            sent     = p["sentiment"]
+            top_rx   = p["top_reactions"]
+            spikes   = p["spike_ranks"]
+            opp      = p["opportunity_score"]
+
+            accent     = ORANGE if i == 0 else BLUE
+            sent_color = _SENT_COLOR.get(sent, GREY)
+
+            # ── Row A: name header (full-width, colored bg) ──────────────────
+            rank_star  = "★ " if i < 3 else ""
+            spike_tag  = ("  스파이크: " + " ".join(f"#{r}" for r in spikes)) if spikes else ""
+            opp_tag    = (f"  기회점수 {opp}" if opp is not None else "")
+            name_cell  = Paragraph(f"{rank_star}{i+1}.  {name}{spike_tag}{opp_tag}", _hn_s)
+
+            # ── Row B: 5 compact stat cells ──────────────────────────────────
+            pos_pct = f"{int(pos_r * 100)}%"
+
+            # Positive-ratio mini bar drawn via a two-cell Table
+            _bar_fill  = max(1, int((fw / 5) * pos_r))
+            _bar_empty = max(0, int(fw / 5) - _bar_fill)
+            _bar_tbl   = Table([[" ", " "]], colWidths=[_bar_fill, _bar_empty],
+                               rowHeights=[4])
+            _bar_tbl.setStyle(TableStyle([
+                ("BACKGROUND",    (0, 0), (0, 0), sent_color),
+                ("BACKGROUND",    (1, 0), (1, 0), SLATE_MID),
+                ("TOPPADDING",    (0, 0), (-1, -1), 0),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+                ("LEFTPADDING",   (0, 0), (-1, -1), 0),
+                ("RIGHTPADDING",  (0, 0), (-1, -1), 0),
+            ]))
+            pos_cell = Table(
+                [[Paragraph(pos_pct, ParagraphStyle(
+                      "_pb", fontName="KR-Bold", fontSize=9, textColor=sent_color,
+                      alignment=TA_CENTER, leading=12))],
+                 [_bar_tbl],
+                 [Paragraph("긍정 비율", _lb_s)]],
+                colWidths=[fw / 5], rowHeights=[7 * mm, 4 * mm, 5 * mm],
+            )
+            pos_cell.setStyle(TableStyle([
+                ("ALIGN",         (0, 0), (-1, -1), "CENTER"),
+                ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
+                ("TOPPADDING",    (0, 0), (-1, -1), 1),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 1),
+                ("LEFTPADDING",   (0, 1), (0, 1), 0),
+                ("RIGHTPADDING",  (0, 1), (0, 1), 0),
+            ]))
+
+            def _sc(label, val, color=BLACK):
+                return Table(
+                    [[Paragraph(str(val), ParagraphStyle(
+                          "_sv2", fontName="KR-Bold", fontSize=10, leading=13,
+                          textColor=color, alignment=TA_CENTER))],
+                     [Paragraph(label, _lb_s)]],
+                    colWidths=[fw / 5], rowHeights=[9 * mm, 5 * mm],
+                )
+
+            stat_row = Table([[
+                _sc("언급", mc, BLUE),
+                _sc("이벤트", events, SLATE),
+                _sc("반응량", total_rx, ORANGE),
+                _sc("이벤트당", f"{rpe:.1f}", GREEN),
+                pos_cell,
+            ]], colWidths=[fw / 5] * 5)
+            stat_row.setStyle(TableStyle([
+                ("BACKGROUND",    (0, 0), (-1, -1), BLUE_LIGHT),
+                ("GRID",          (0, 0), (-1, -1), 0.3, BLUE_MID),
+                ("VALIGN",        (0, 0), (-1, -1), "MIDDLE"),
+                ("TOPPADDING",    (0, 0), (-1, -1), 2),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+            ]))
+
+            # ── Row C: top reactions inline ──────────────────────────────────
+            rx_parts = "  ·  ".join(
+                f"<b>{cnt}</b> {cat}" for cat, cnt in top_rx[:4]
+            ) if top_rx else "—"
+            sent_line = Paragraph(
+                f"감성: <b>{sent}</b>　　{rx_parts}",
+                ParagraphStyle("_crl", fontName="KR", fontSize=7.5, leading=11,
+                               textColor=SLATE, wordWrap="CJK"),
+            )
+
+            # ── Assemble compact card table ───────────────────────────────────
+            card = Table(
+                [[name_cell], [stat_row], [sent_line]],
+                colWidths=[fw],
+            )
+            card.setStyle(TableStyle([
+                ("BACKGROUND",    (0, 0), (0, 0), accent),
+                ("BACKGROUND",    (0, 2), (0, 2), SLATE_LIGHT),
+                ("TOPPADDING",    (0, 0), (0, 0), 5),
+                ("BOTTOMPADDING", (0, 0), (0, 0), 5),
+                ("LEFTPADDING",   (0, 0), (0, 0), 8),
+                ("TOPPADDING",    (0, 2), (0, 2), 4),
+                ("BOTTOMPADDING", (0, 2), (0, 2), 4),
+                ("LEFTPADDING",   (0, 2), (0, 2), 8),
+                ("TOPPADDING",    (0, 1), (0, 1), 0),
+                ("BOTTOMPADDING", (0, 1), (0, 1), 0),
+                ("LEFTPADDING",   (0, 1), (0, 1), 0),
+                ("RIGHTPADDING",  (0, 1), (0, 1), 0),
+                ("BOX",           (0, 0), (-1, -1), 0.5, SLATE_MID),
+            ]))
+            story.append(KeepTogether([card, vspace(2)]))
+
+        story.append(PageBreak())
+
+        # ── 5. Compact opportunity section  (summary only) ───────────────────
+        if is_summary:
+            story.extend(section_heading("5.  발굴 선수 분석 — 저인지·고반응 기회 후보"))
+            story.append(P(
+                "언급 횟수는 적지만 등장할 때마다 강하고 긍정적인 반응을 이끌어낸 선수입니다.  "
+                "콘텐츠 노출을 늘렸을 때 빠른 반응 성장이 기대되는 발굴 우선 검토 후보를 제시합니다.",
+                STYLES["body"]))
+            story.append(vspace(2))
+
+            eligible_s = sorted(
+                [p for p in player_list
+                 if p["opportunity_score"] is not None
+                 and _is_official_player(p["name"])],
+                key=lambda x: x["opportunity_score"], reverse=True,
+            )
+            # Exclude the top-2 dominant players (already established)
+            _by_mc_s  = sorted(player_list, key=lambda x: x["mention_count"], reverse=True)
+            _dom_s    = {_by_mc_s[i]["name"] for i in range(min(2, len(_by_mc_s)))}
+            opp_s     = [p for p in eligible_s if p["name"] not in _dom_s]
+
+            if eligible_s:
+                median_mc_s = sorted(
+                    p["mention_count"] for p in eligible_s
+                )[len(eligible_s) // 2]
+                rows_s = []
+                for p in eligible_s[:5]:
+                    flag = "★" if p["mention_count"] <= median_mc_s else ""
+                    rows_s.append([
+                        flag + p["name"],
+                        str(p["mention_count"]),
+                        f"{p['rx_per_event']:.1f}",
+                        f"{int(p['pos_ratio'] * 100)}%",
+                        p["sentiment"],
+                        str(p["opportunity_score"]),
+                    ])
+                story.append(info_table(
+                    ["선수", "언급수", "이벤트당\n반응", "긍정\n비율", "감성", "기회\n점수"],
+                    rows_s,
+                    col_widths=[0.27, 0.10, 0.13, 0.12, 0.20, 0.13],
+                ))
+                story.append(vspace(2))
+                story.append(note_box(
+                    "★ = 중앙값 이하 언급 횟수 (저인지 후보).  "
+                    "기회 점수 상위 + ★ 조합이 발굴 우선 검토 선수입니다."
+                ))
+            else:
+                story.append(note_box(
+                    "기회 점수를 계산할 수 있는 선수가 없습니다 (언급 이벤트 2회 미만)."
+                ))
+
+            # ── Top-1 discovery player: rich 4-part narrative ──────────────
+            if opp_s:
+                _top_opp = opp_s[0]
+                story.append(vspace(4))
+                story.append(P(
+                    f"발굴 우선 선수 심층 분석 — {_top_opp['name']}",
+                    ParagraphStyle("_toph", fontName="KR-Bold", fontSize=11,
+                                   leading=16, textColor=GREEN,
+                                   spaceBefore=4, spaceAfter=3)))
+                story.append(rule(GREEN, 1))
+
+                _spike_moms_s = d.get("spike_moments", [])
+                _text_msgs_s  = [m for m in d.get("messages", [])
+                                  if m.get("message_type", "text") == "text"]
+                _disc_s = _build_discovery_narrative(
+                    _top_opp, _spike_moms_s, _text_msgs_s)
+
+                _dlbl_s = ParagraphStyle(
+                    "_dlbls", fontName="KR-Bold", fontSize=9, leading=14,
+                    textColor=BLUE, spaceBefore=5, spaceAfter=2, wordWrap="CJK")
+                _dbdy_s = ParagraphStyle(
+                    "_dbdys", fontName="KR", fontSize=9, leading=15,
+                    textColor=BLACK, wordWrap="CJK", spaceAfter=2,
+                    alignment=TA_JUSTIFY)
+                _dchat_s = ParagraphStyle(
+                    "_dchats", fontName="KR", fontSize=8, leading=12,
+                    textColor=GREY, wordWrap="CJK", leftIndent=10)
+
+                # ① CONTEXT
+                story.append(P("① 맥락 — 어떤 순간에 주목받았나", _dlbl_s))
+                if _disc_s["context"]:
+                    for _cl in _disc_s["context"]:
+                        story.append(P("• " + _cl, _dbdy_s))
+                if _disc_s["chat_samples"]:
+                    story.append(P("관련 채팅 샘플:", ParagraphStyle(
+                        "_csls", fontName="KR", fontSize=8, leading=11,
+                        textColor=GREY, spaceBefore=2)))
+                    for _cm in _disc_s["chat_samples"][:4]:
+                        _ts = fmt_seconds(_cm.get("timestamp_seconds", 0))
+                        _au = safe_str(_cm.get("author", ""))[:14]
+                        _tx = safe_str(_cm.get("text", ""))[:60]
+                        story.append(P(f"  [{_ts}] {_au}: {_tx}", _dchat_s))
+                story.append(vspace(2))
+
+                # ② AUDIENCE REACTION
+                story.append(P("② 시청자 반응 — 반응의 성격과 톤", _dlbl_s))
+                story.append(P(_disc_s["reaction_text"], _dbdy_s))
+                for _cat_label, _cat_msgs in [
+                    ("발견·인식 반응", _disc_s["discovery_msgs"][:2]),
+                    ("감탄·기대 반응", _disc_s["admiration_msgs"][:2]),
+                    ("종반 지속 관심", _disc_s["sustained_msgs"][:2]),
+                ]:
+                    if _cat_msgs:
+                        story.append(P(_cat_label + ":", ParagraphStyle(
+                            "_catlbl", fontName="KR", fontSize=8, leading=11,
+                            textColor=GREY, spaceBefore=1)))
+                        for _m in _cat_msgs:
+                            _ts = fmt_seconds(_m.get("timestamp_seconds", 0))
+                            _tx = safe_str(_m.get("text", ""))[:60]
+                            story.append(P(f"  [{_ts}] {_tx}", _dchat_s))
+                story.append(vspace(2))
+
+                # ③ INTERPRETATION
+                story.append(P("③ 해석 — 단발 스파이크인가, 팬덤 전환 신호인가", _dlbl_s))
+                story.append(callout(_disc_s["interpretation"], GREEN))
+                story.append(vspace(2))
+
+                # ④ CONTENT ACTION
+                story.append(P("④ 권고 콘텐츠 행동", _dlbl_s))
+                story.append(callout(_disc_s["content_action"], ORANGE))
+                story.append(vspace(3))
+
+        # ── 8-C. Opportunity table  (full report only) ───────────────────────
+        if not is_summary:
+            _sec8c: list = []
+            _sec8c.extend(section_heading("8-C.  발굴 기회 분석 — 저인지·고반응 선수"))
+            _sec8c.append(P(
+                "<b>기회 점수(Opportunity Score)</b>는 '언급량은 적지만 등장할 때마다 강하고 "
+                "긍정적인 시청자 반응을 이끌어내는' 선수를 찾기 위한 지표입니다.  "
+                "이런 선수는 콘텐츠 노출을 늘렸을 때 시청자 반응이 빠르게 성장할 가능성이 있습니다.",
+                STYLES["body"]))
+            _sec8c.append(vspace(2))
+            _sec8c.append(callout(
+                "기회 점수 = (이벤트당 반응 수) × (0.4 + 0.6 × 긍정 비율)  →  0–100 정규화\n"
+                "높은 점수: 등장 빈도는 낮아도 시청자가 즉각·긍정적으로 반응하는 선수\n"
+                "낮은 점수: 자주 언급되지만 반응 강도·긍정성이 평균 이하인 선수",
+                BLUE
             ))
+            _sec8c.append(vspace(3))
+            eligible_opp = sorted(
+                [p for p in player_list
+                 if p["opportunity_score"] is not None
+                 and _is_official_player(p["name"])],
+                key=lambda x: x["opportunity_score"], reverse=True
+            )
+            if eligible_opp:
+                rows_opp = []
+                median_mc = sorted(p["mention_count"] for p in eligible_opp)[len(eligible_opp) // 2]
+                for p in eligible_opp:
+                    flag = "★" if p["mention_count"] <= median_mc else ""
+                    rows_opp.append([
+                        flag + p["name"],
+                        str(p["mention_count"]),
+                        str(p["total_rx"]),
+                        f"{p['rx_per_event']:.1f}",
+                        f"{int(p['pos_ratio'] * 100)}%",
+                        p["sentiment"],
+                        str(p["opportunity_score"]),
+                    ])
+                _sec8c.append(info_table(
+                    ["선수", "언급수", "반응량", "이벤트당\n반응", "긍정\n비율", "감성", "기회\n점수"],
+                    rows_opp,
+                    col_widths=[0.24, 0.09, 0.09, 0.10, 0.09, 0.17, 0.10],
+                ))
+                _sec8c.append(vspace(2))
+                _sec8c.append(note_box(
+                    "★ 표시 = 데이터셋 내 중앙값 이하 언급 횟수 (저인지 후보).  "
+                    "기회 점수 상위 + ★ 조합이 '발굴 우선 검토' 선수입니다.  "
+                    "최소 2회 이상 언급 이벤트가 있는 선수만 포함됩니다."
+                ))
+            else:
+                _sec8c.append(note_box(
+                    "기회 점수를 계산할 수 있는 선수가 없습니다 "
+                    "(언급 이벤트 2회 미만). 더 긴 영상이나 더 많은 채팅 데이터가 필요합니다."
+                ))
+            story.extend(_sec8c)
 
         story.append(PageBreak())
 
     # ═══════════════════════════════════════════════════════════════
-    # PAGE 9 — Data requirements + Limitations
+    # PAGE 9 — Data requirements + Limitations  (full report only)
     # ═══════════════════════════════════════════════════════════════
+    if is_summary:
+        return story   # summary ends after Section 8-B
+
     story.extend(section_heading("추가 데이터 요구사항 및 분석 한계"))
 
     story.append(P("<b>두 신호 연결 방식</b>", STYLES["h3"]))
@@ -3157,14 +4454,21 @@ def main():
     print(f"[live_chat_report] 스파이크 {d['spike_count']}개 로드 / "
           f"세그먼트: {'있음' if d['has_segments'] else '없음'}")
 
-    print("[live_chat_report] 리포트 생성 중...")
-    story = build_story(d)
+    # ── Full report ───────────────────────────────────────────────────────────
+    print("[live_chat_report] 전체 리포트 생성 중...")
+    out_full = str(OUTPUT_DIR / "live_chat_insight_report.pdf")
+    doc_full = make_doc(out_full)
+    doc_full.build(build_story(d, is_summary=False))
+    size_full = Path(out_full).stat().st_size // 1024
+    print(f"[live_chat_report] 완료: {out_full}  ({size_full} KB)")
 
-    out_path = str(OUTPUT_DIR / "live_chat_insight_report.pdf")
-    doc = make_doc(out_path)
-    doc.build(story)
-    size_kb = Path(out_path).stat().st_size // 1024
-    print(f"[live_chat_report] 완료: {out_path}  ({size_kb} KB)")
+    # ── Summary report ────────────────────────────────────────────────────────
+    print("[live_chat_report] 요약 리포트 생성 중...")
+    out_summ = str(OUTPUT_DIR / "live_chat_summary_report.pdf")
+    doc_summ = make_doc(out_summ)
+    doc_summ.build(build_story(d, is_summary=True))
+    size_summ = Path(out_summ).stat().st_size // 1024
+    print(f"[live_chat_report] 완료: {out_summ}  ({size_summ} KB)")
 
 
 if __name__ == "__main__":
