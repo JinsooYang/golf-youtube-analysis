@@ -1,20 +1,23 @@
 #!/bin/bash
 #
-# generate_report — config-driven live-chat report pipeline
+# generate_report — config-driven viewer reaction report pipeline
 #
 # Usage:
 #   ./generate_report config.json
 #
-# Reads runtime options from a JSON config file and runs the full pipeline:
-#   Step 1  Download video + subtitles    (if download_video is true)
-#   Step 2  Fetch YouTube comments        (if analyze_comments is true)
-#   Step 3  Extract live chat replay      (if analyze_live_chat is true)
-#   Step 4  Build highlight package
-#   Step 5  Generate live-chat PDF report
+# Steps:
+#   1  Download video + subtitle extraction  (download_video / analyze_subtitles)
+#   2  Fetch YouTube comments                (analyze_comments)
+#   3  Extract live chat replay              (analyze_live_chat)
+#   4  Build highlight package (spike detection)
+#   5  Generate PDF report
 #
-# Output:
-#   output/live_chat_insight_report.pdf
-#   output/live_chat_summary_report.pdf
+# Final outputs:
+#   output/insight_report.pdf
+#   output/insight_report_summary.pdf        (combined mode only)
+#
+# All intermediate artifacts (CSV, JSON, logs) go to:
+#   output/intermediate/
 #
 
 # ── Colour helpers ─────────────────────────────────────────────────────────────
@@ -40,7 +43,7 @@ cd "$SCRIPT_DIR"
 if [ -z "${1:-}" ]; then
     echo -e "${BOLD}Usage:${NC}  ./generate_report config.json"
     echo ""
-    echo "Reads all options from a JSON config file. Minimal example:"
+    echo "Reads all options from a JSON config file. Example:"
     echo ""
     echo '  {'
     echo '    "youtube_url":       "https://www.youtube.com/watch?v=VIDEO_ID",'
@@ -50,9 +53,9 @@ if [ -z "${1:-}" ]; then
     echo '    "analyze_live_chat": true'
     echo '  }'
     echo ""
-    echo "Output:"
-    echo "  output/live_chat_insight_report.pdf"
-    echo "  output/live_chat_summary_report.pdf"
+    echo "Final outputs:"
+    echo "  output/insight_report.pdf"
+    echo "  output/insight_report_summary.pdf  (combined mode only)"
     exit 1
 fi
 
@@ -107,18 +110,19 @@ PYEOF
 
 LESSON_DIR="lesson_${VIDEO_ID}"
 SEGMENTS_FILE="${LESSON_DIR}/segments.json"
+INTER="output/intermediate"
 
 echo ""
 echo -e "${BOLD}╔══════════════════════════════════════════╗${NC}"
-echo -e "${BOLD}║   Golf YouTube Live-Chat Report          ║${NC}"
+echo -e "${BOLD}║   Golf YouTube Viewer Reaction Report    ║${NC}"
 echo -e "${BOLD}╚══════════════════════════════════════════╝${NC}"
 echo -e "  Config   : ${CYAN}${CONFIG_FILE}${NC}"
 echo -e "  Video ID : ${CYAN}${VIDEO_ID}${NC}"
 echo -e "  Options  : download_video=${DOWNLOAD_VIDEO}  analyze_subtitles=${ANALYZE_SUBTITLES}  analyze_comments=${ANALYZE_COMMENTS}  analyze_live_chat=${ANALYZE_LIVE_CHAT}"
 
-mkdir -p output
+mkdir -p output "${INTER}"
 
-# ── Step 1: Download video + subtitles ────────────────────────────────────────
+# ── Step 1: Video download + subtitle extraction ───────────────────────────────
 step "Step 1/5  Video download + subtitle extraction"
 
 if [ "$DOWNLOAD_VIDEO" = "true" ]; then
@@ -128,39 +132,53 @@ if [ "$DOWNLOAD_VIDEO" = "true" ]; then
         warn "youtube_extractor.sh failed — continuing without video/subtitles."
     fi
 else
-    skip "download_video is false"
+    skip "download_video is false — video download skipped."
 fi
 
-# Decide whether segments are usable (regardless of how they got there)
-if [ "$ANALYZE_SUBTITLES" = "true" ] && [ -f "$SEGMENTS_FILE" ]; then
-    USE_SEGMENTS=true
-    ok "Subtitle segments found: ${SEGMENTS_FILE}"
-else
-    USE_SEGMENTS=false
-    if [ "$ANALYZE_SUBTITLES" = "true" ]; then
-        warn "No segments file at ${SEGMENTS_FILE} — pipeline will run without --segments."
+# Decide whether segments are usable (regardless of how they got there).
+# Subtitle download uses --skip-download and is independent of video download.
+USE_SEGMENTS=false
+if [ "$ANALYZE_SUBTITLES" = "true" ]; then
+    if [ -f "$SEGMENTS_FILE" ]; then
+        USE_SEGMENTS=true
+        ok "Subtitle segments found: ${SEGMENTS_FILE}"
+    elif [ "$DOWNLOAD_VIDEO" != "true" ]; then
+        # Video skipped but subtitles requested — run subtitle-only extraction.
+        ok "Subtitle segments not cached — running subtitle-only extraction."
+        if bash youtube_extractor.sh --subtitles-only "$URL"; then
+            if [ -f "$SEGMENTS_FILE" ]; then
+                USE_SEGMENTS=true
+                ok "Subtitle segments generated: ${SEGMENTS_FILE}"
+            else
+                warn "Subtitle extraction ran but no segments.json produced (video may lack auto-captions) — pipeline will run without --segments."
+            fi
+        else
+            warn "Subtitle-only extraction failed — pipeline will run without --segments."
+        fi
     else
-        skip "analyze_subtitles is false"
+        warn "No segments file at ${SEGMENTS_FILE} — pipeline will run without --segments."
     fi
+else
+    skip "analyze_subtitles is false"
 fi
 
 # ── Step 2: Fetch YouTube comments ────────────────────────────────────────────
 step "Step 2/5  YouTube comment fetch"
 
 if [ "$ANALYZE_COMMENTS" = "true" ]; then
-    if ! python3 main.py "$URL"; then
+    if ! python3 main.py "$URL" --output-dir "${INTER}"; then
         fatal "main.py failed. Check that YOUTUBE_API_KEY is set in .env and the video is public."
     fi
-    [ -f "output/comments_cleaned.csv" ] \
-        || fatal "output/comments_cleaned.csv was not created. Check main.py output above."
-    COMMENT_LINES=$(wc -l < "output/comments_cleaned.csv" | tr -d ' ')
+    [ -f "${INTER}/comments_cleaned.csv" ] \
+        || fatal "${INTER}/comments_cleaned.csv was not created. Check main.py output above."
+    COMMENT_LINES=$(wc -l < "${INTER}/comments_cleaned.csv" | tr -d ' ')
     ok "Comments fetched — ${COMMENT_LINES} lines (including header)."
 else
     skip "analyze_comments is false"
-    if [ ! -f "output/comments_cleaned.csv" ]; then
-        warn "output/comments_cleaned.csv not found — highlight pipeline will run in live-chat-only mode."
+    if [ ! -f "${INTER}/comments_cleaned.csv" ]; then
+        warn "${INTER}/comments_cleaned.csv not found — highlight pipeline will run in live-chat-only mode."
         echo "comment_id,author,text,like_count,is_reply,reply_count,published_at" \
-            > output/comments_cleaned.csv
+            > "${INTER}/comments_cleaned.csv"
     fi
 fi
 
@@ -168,26 +186,27 @@ fi
 step "Step 3/5  Live chat extraction"
 
 if [ "$ANALYZE_LIVE_CHAT" = "true" ]; then
-    if ! python3 extract_live_chat.py "$URL"; then
+    if ! python3 extract_live_chat.py "$URL" --output-dir "${INTER}"; then
         fatal "Live chat extraction failed.\nPossible causes:\n  • Stream has not ended yet\n  • Chat replay is disabled for this video\n  • yt-dlp is outdated — run: pip install -U yt-dlp"
     fi
-    [ -f "output/live_chat_normalized.csv" ] \
-        || fatal "output/live_chat_normalized.csv was not created. Check output/live_chat_extract.log."
-    CHAT_LINES=$(wc -l < "output/live_chat_normalized.csv" | tr -d ' ')
+    [ -f "${INTER}/live_chat_normalized.csv" ] \
+        || fatal "${INTER}/live_chat_normalized.csv was not created. Check ${INTER}/live_chat_extract.log."
+    CHAT_LINES=$(wc -l < "${INTER}/live_chat_normalized.csv" | tr -d ' ')
     ok "Live chat extracted — ${CHAT_LINES} lines (including header)."
 else
     skip "analyze_live_chat is false"
-    [ -f "output/live_chat_normalized.csv" ] \
-        || fatal "analyze_live_chat is false but output/live_chat_normalized.csv does not exist.\nEnable analyze_live_chat or provide the file manually."
+    [ -f "${INTER}/live_chat_normalized.csv" ] \
+        || fatal "analyze_live_chat is false but ${INTER}/live_chat_normalized.csv does not exist.\nEnable analyze_live_chat or provide the file manually."
 fi
 
 # ── Step 4: Highlight pipeline ────────────────────────────────────────────────
 step "Step 4/5  Highlight pipeline (spike detection)"
 
 PIPELINE_CMD=(python3 highlight_pipeline.py
-    --comments  output/comments_cleaned.csv
-    --live-chat output/live_chat_normalized.csv
+    --comments  "${INTER}/comments_cleaned.csv"
+    --live-chat "${INTER}/live_chat_normalized.csv"
     --video-id  "$VIDEO_ID"
+    --output-dir "${INTER}"
 )
 
 if [ "$USE_SEGMENTS" = "true" ]; then
@@ -200,13 +219,13 @@ fi
 if ! "${PIPELINE_CMD[@]}"; then
     fatal "highlight_pipeline.py failed."
 fi
-ok "Highlight package built: output/highlight_package.json"
+ok "Highlight package built: ${INTER}/highlight_package.json"
 
 # ── Step 5: Generate PDF report ───────────────────────────────────────────────
 step "Step 5/5  PDF report generation"
 
-if ! python3 generate_report_by_live_chat.py; then
-    fatal "generate_report_by_live_chat.py failed."
+if ! python3 report.py; then
+    fatal "report.py failed."
 fi
 
 # ── Summary ───────────────────────────────────────────────────────────────────
@@ -215,12 +234,25 @@ echo -e "${BOLD}╔════════════════════�
 echo -e "${BOLD}║   Done                                   ║${NC}"
 echo -e "${BOLD}╚══════════════════════════════════════════╝${NC}"
 echo ""
+echo -e "${BOLD}  Final reports:${NC}"
 
 for f in \
-    "output/live_chat_insight_report.pdf" \
-    "output/live_chat_summary_report.pdf" \
-    "output/highlight_package.json" \
-    "output/spike_moments.csv"
+    "output/insight_report.pdf" \
+    "output/insight_report_summary.pdf"
+do
+    if [ -f "$f" ]; then
+        SIZE=$(du -sh "$f" 2>/dev/null | cut -f1)
+        ok "${f}  (${SIZE})"
+    fi
+done
+
+echo ""
+echo -e "${BOLD}  Intermediate artifacts:${NC}  ${INTER}/"
+for f in \
+    "${INTER}/highlight_package.json" \
+    "${INTER}/spike_moments.csv" \
+    "${INTER}/comments_cleaned.csv" \
+    "${INTER}/live_chat_normalized.csv"
 do
     if [ -f "$f" ]; then
         SIZE=$(du -sh "$f" 2>/dev/null | cut -f1)

@@ -1,16 +1,28 @@
 """
-Live-chat-based Highlight Insight PDF Report
+Viewer Reaction Analysis Report — unified report generator.
 
-Input files (all from output/):
-  - live_chat_normalized.csv        (required)
-  - highlight_package.json          (required — contains spike_moments)
-  - spike_moments.csv               (fallback if highlight_package missing)
+Automatically selects report mode from available data:
 
-Optional, for transcript-based "why" context:
-  - lesson_{VIDEO_ID}/segments.json  (produced by youtube_extractor.sh when subtitles exist)
+  combined (live chat + comments)
+    Requires: output/intermediate/live_chat_normalized.csv,
+              output/intermediate/highlight_package.json
+    Optional: output/intermediate/comments_cleaned.csv,
+              output/intermediate/analysis_summary.md,
+              lesson_{VIDEO_ID}/segments.json
+    Output:   output/insight_report.pdf
+              output/insight_report_summary.pdf
 
-Run: python generate_report_by_live_chat.py
-Output: output/live_chat_insight_report.pdf
+  comments only (no live chat)
+    Requires: output/intermediate/comments_cleaned.csv
+    Optional: output/intermediate/analysis_summary.md,
+              output/intermediate/top_keywords.csv,
+              output/intermediate/top_authors.csv
+    Output:   output/insight_report.pdf
+
+Intermediate artifacts (CSV, JSON, logs) live in output/intermediate/.
+Final PDFs are written directly to output/.
+
+Run: python report.py
 """
 
 import csv
@@ -42,8 +54,10 @@ from reportlab.graphics.shapes import Drawing, Rect, Line, String as GString
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 FONT_DIR   = Path("fonts")
-OUTPUT_DIR = Path("output")
+OUTPUT_DIR       = Path("output")
+INTERMEDIATE_DIR = Path("output/intermediate")
 OUTPUT_DIR.mkdir(exist_ok=True)
+INTERMEDIATE_DIR.mkdir(parents=True, exist_ok=True)
 
 # ── Font registration ─────────────────────────────────────────────────────────
 pdfmetrics.registerFont(TTFont("KR",      str(FONT_DIR / "NanumGothic-Regular.ttf")))
@@ -103,7 +117,7 @@ def make_doc(path: str) -> BaseDocTemplate:
         path, pagesize=A4,
         leftMargin=M, rightMargin=M,
         topMargin=M + 8 * mm, bottomMargin=M + 8 * mm,
-        title="라이브 채팅 기반 하이라이트 인사이트 리포트",
+        title="시청자 반응 분석 리포트",
         author="GTOUR Analysis",
     )
     fw = PW - 2 * M
@@ -115,7 +129,7 @@ def make_doc(path: str) -> BaseDocTemplate:
         canvas.line(M, PH - M - 4 * mm, PW - M, PH - M - 4 * mm)
         canvas.setFont("KR-Bold", 7.5)
         canvas.setFillColor(BLUE)
-        canvas.drawString(M, PH - M - 1.5 * mm, "라이브 채팅 기반 하이라이트 인사이트")
+        canvas.drawString(M, PH - M - 1.5 * mm, "시청자 반응 분석 리포트")
         canvas.setFont("KR", 7.5)
         canvas.setFillColor(GREY)
         canvas.drawRightString(PW - M, PH - M - 1.5 * mm, "Live Chat Spike Report")
@@ -309,6 +323,53 @@ def note_box(text: str) -> Table:
         ("GRID",          (0, 0), (-1, -1), 0.4, SLATE_MID),
     ]))
     return t
+
+
+def quote_card(likes: str, author: str, text: str, accent=BLUE):
+    fw = PW - 2 * M
+    likes_style = ParagraphStyle(
+        "lk", fontName="KR-Bold", fontSize=11, textColor=accent,
+        alignment=TA_CENTER, leading=16)
+    likes_label = ParagraphStyle(
+        "lkl", fontName="KR", fontSize=7.5, textColor=GREY,
+        alignment=TA_CENTER)
+    author_style = ParagraphStyle(
+        "auth", fontName="KR-Bold", fontSize=8, textColor=GREY, leading=12)
+    text_style = ParagraphStyle(
+        "qt2", fontName="KR", fontSize=9, leading=15, textColor=SLATE,
+        wordWrap="CJK", alignment=TA_JUSTIFY)
+
+    lw = 18 * mm
+    rw = fw - lw - 3 * mm
+
+    lt = Table([[Paragraph(likes, likes_style), Paragraph("likes", likes_label)]],
+               colWidths=[lw])
+    lt.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (0, -1), BLUE_LIGHT),
+        ("VALIGN",     (0, 0), (0, -1), "MIDDLE"),
+        ("ALIGN",      (0, 0), (0, -1), "CENTER"),
+        ("TOPPADDING",    (0, 0), (-1, -1), 8),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+    ]))
+    rt = Table([[Paragraph(author, author_style)], [Paragraph(text, text_style)]],
+               colWidths=[rw])
+    rt.setStyle(TableStyle([
+        ("TOPPADDING",    (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+        ("LEFTPADDING",   (0, 0), (-1, -1), 8),
+        ("RIGHTPADDING",  (0, 0), (-1, -1), 8),
+        ("BACKGROUND",    (0, 0), (-1, -1), SLATE_LIGHT),
+    ]))
+    outer = Table([[lt, rt]], colWidths=[lw, rw + 3 * mm])
+    outer.setStyle(TableStyle([
+        ("VALIGN",          (0, 0), (-1, -1), "TOP"),
+        ("GRID",            (0, 0), (-1, -1), 0.4, SLATE_MID),
+        ("LEFTPADDING",     (0, 0), (-1, -1), 0),
+        ("RIGHTPADDING",    (0, 0), (-1, -1), 0),
+        ("TOPPADDING",      (0, 0), (-1, -1), 0),
+        ("BOTTOMPADDING",   (0, 0), (-1, -1), 0),
+    ]))
+    return [outer, vspace(2)]
 
 def buzz_box(buzz: dict) -> Table:
     """
@@ -661,7 +722,7 @@ _NON_PLAYER_NAMES: frozenset[str] = frozenset({
 # accepted as a valid candidate regardless of the grammar-filter rules below.
 # Names NOT in the official list still go through the three-layer filter.
 #
-_GTOUR_PLAYERS_CACHE = OUTPUT_DIR / "gtour_players.json"
+_GTOUR_PLAYERS_CACHE = INTERMEDIATE_DIR / "gtour_players.json"
 _GTOUR_CACHE_TTL_DAYS = 7          # re-fetch after this many days
 _GTOUR_API_BASE = "https://www.gtour.com/api/player/list"
 
@@ -2758,17 +2819,181 @@ def build_player_analysis(
     return raw[:15]
 
 
+# ── Mode detection ────────────────────────────────────────────────────────────
+
+def detect_mode() -> str:
+    """
+    Determine report mode from available output files.
+
+    'combined'  — live_chat_normalized.csv is present and non-empty.
+                  Report uses both live chat (spike analysis, real-time reactions,
+                  player detection) AND comments (narrative, audience interpretation).
+    'comments'  — live chat unavailable or empty; report uses comments only.
+
+    Mode is detected automatically — no config flag needed.
+    """
+    chat_path = INTERMEDIATE_DIR / "live_chat_normalized.csv"
+    if chat_path.exists():
+        with open(chat_path, encoding="utf-8-sig") as f:
+            line_count = sum(1 for _ in f)
+        if line_count > 1:   # more than just the header row
+            return "combined"
+    return "comments"
+
+
+# ── Comment data loader (always loaded regardless of mode) ────────────────────
+
+def load_comment_data() -> dict:
+    """
+    Load comment analysis data from output/ files.
+
+    Used in both modes:
+      'comments'  — primary data source for the report
+      'combined'  — provides the audience narrative / keyword / sentiment layer
+                    that complements the live-chat spike analysis
+
+    Returns an empty dict (no comments available) if files are missing.
+    """
+    import re as _re
+    d: dict = {}
+
+    # comments_cleaned.csv
+    comments: list = []
+    comments_path = INTERMEDIATE_DIR / "comments_cleaned.csv"
+    if comments_path.exists():
+        with open(comments_path, newline="", encoding="utf-8-sig") as f:
+            for row in csv.DictReader(f):
+                row["like_count"] = int(row.get("like_count") or 0)
+                row["is_reply"]   = row.get("is_reply", "False") == "True"
+                comments.append(row)
+
+    top_level = [c for c in comments if not c["is_reply"]]
+    replies   = [c for c in comments if c["is_reply"]]
+    d["comments"]        = comments
+    d["top_level_count"] = len(top_level)
+    d["reply_count"]     = len(replies)
+    d["total_comments"]  = len(comments)
+    d["unique_authors"]  = len({c["author"] for c in comments})
+    d["total_likes"]     = sum(c["like_count"] for c in comments)
+    d["max_likes"]       = max((c["like_count"] for c in comments), default=0)
+    d["top_comments"]    = sorted(comments, key=lambda c: c["like_count"], reverse=True)[:10]
+
+    # analysis_summary.md
+    d["generated_date"]     = ""
+    d["dominant_sentiment"] = ""
+    d["recommendations"]    = []
+    d["themes"]             = []
+    d["marketing_angles"]   = []
+    d["limitations"]        = []
+    d["sentiment_rows"]     = []
+
+    summary_path = INTERMEDIATE_DIR / "analysis_summary.md"
+    if summary_path.exists():
+        txt = summary_path.read_text(encoding="utf-8")
+        m = _re.search(r"\*\*Generated:\*\*\s*(.+?)(?:\n|$)", txt)
+        if m: d["generated_date"] = m.group(1).strip()
+        m = _re.search(r"\*\*Dominant emotional tone:\*\*\s*`([^`]+)`", txt)
+        if m: d["dominant_sentiment"] = m.group(1)
+        sec = _re.search(r"## Content Strategy Recommendations\n(.*?)(?=\n## |\Z)", txt, _re.DOTALL)
+        if sec:
+            recs = _re.findall(
+                r"\*\*\d+\.\*\*\s*(.*?)(?=\n\n\*\*\d+\.\*\*|\n\n##|\Z)",
+                sec.group(1), _re.DOTALL)
+            d["recommendations"] = [r.strip().replace("\n", " ") for r in recs]
+        sec = _re.search(r"## High-Engagement Themes\n.*?\n((?:- `[^`]+`\n?)+)", txt)
+        if sec: d["themes"] = _re.findall(r"`([^`]+)`", sec.group(1))
+        sec = _re.search(r"## Marketing & Monetization Angles\n(.*?)(?=\n## |\Z)", txt, _re.DOTALL)
+        if sec:
+            d["marketing_angles"] = [
+                a.strip().replace("\n", " ")
+                for a in _re.findall(r"^- (.+?)(?=\n-|\Z)", sec.group(1), _re.DOTALL | _re.MULTILINE)
+                if a.strip()
+            ]
+        sec = _re.search(r"## Limitations & Scope Notes\n(.*?)(?=\n## |\Z)", txt, _re.DOTALL)
+        if sec:
+            d["limitations"] = [
+                l.strip().replace("\n", " ")
+                for l in _re.findall(r"^- (.+?)(?=\n-|\Z)", sec.group(1), _re.DOTALL | _re.MULTILINE)
+                if l.strip()
+            ]
+        d["sentiment_rows"] = _re.findall(r"\| ([^|\-][^|]+?) \| (\d+) \| ([\d.]+%) \|", txt)
+
+    # top_keywords.csv
+    d["unigrams"] = []
+    d["bigrams"]  = []
+    kw_path = INTERMEDIATE_DIR / "top_keywords.csv"
+    if kw_path.exists():
+        with open(kw_path, newline="", encoding="utf-8-sig") as f:
+            for row in csv.DictReader(f):
+                row["count"] = int(row.get("count") or 0)
+                if row.get("type") == "bigram":
+                    d["bigrams"].append(row)
+                else:
+                    d["unigrams"].append(row)
+
+    # top_authors.csv
+    d["top_authors"] = []
+    auth_path = INTERMEDIATE_DIR / "top_authors.csv"
+    if auth_path.exists():
+        with open(auth_path, newline="", encoding="utf-8-sig") as f:
+            for row in csv.DictReader(f):
+                row["comment_count"] = int(row.get("comment_count") or 0)
+                row["total_likes"]   = int(row.get("total_likes")   or 0)
+                d["top_authors"].append(row)
+
+    # highlight_package.json — title suggestions for comments-mode content strategy
+    d["title_suggestions"] = []
+    hp_path = INTERMEDIATE_DIR / "highlight_package.json"
+    if hp_path.exists():
+        hp = json.loads(hp_path.read_text(encoding="utf-8"))
+        mp = hp.get("master_plan") or {}
+        if isinstance(mp, dict):
+            d["title_suggestions"] = mp.get("title_suggestions", [])
+
+    return d
+
+
 # ── Data loader ───────────────────────────────────────────────────────────────
 
 def load_data() -> dict:
-    """Load all report inputs from output/ files and enrich spike moments."""
-    d: dict = {}
+    """
+    Load all report inputs from output/ files and enrich spike moments.
+
+    Automatically detects mode via detect_mode():
+      'combined'  — loads live chat + comments; full spike/player analysis
+      'comments'  — loads comments only; returns a lightweight dict
+    """
+    mode = detect_mode()
+    d: dict = {"mode": mode}
+    d["comment_data"] = load_comment_data()
+
+    if mode == "comments":
+        # No live chat available — populate neutral defaults so build_story
+        # can branch cleanly without KeyError on any shared key.
+        d.update({
+            "messages": [], "total_messages": 0, "unique_chatters": 0,
+            "video_id":  d["comment_data"]["comments"][0].get("video_id", "—")
+                         if d["comment_data"]["comments"] else "—",
+            "video_url": d["comment_data"]["comments"][0].get("video_url", "")
+                         if d["comment_data"]["comments"] else "",
+            "video_duration_sec": 0, "video_duration_text": "—",
+            "text_message_count": 0, "active_participants": {},
+            "spike_moments": [], "title_suggestions": d["comment_data"]["title_suggestions"],
+            "shorts_sequences": [], "hp_meta": {}, "spike_count": 0, "top_spike": None,
+            "has_segments": False, "segment_count": 0,
+            "chat_density_by_minute": [], "chat_density_timeline": [],
+            "top_spike_keywords": [], "top_spike_events": [],
+            "overall_reaction_profile": [], "player_analysis": [],
+        })
+        return d
+
+    # ── combined mode: full live-chat + spike + player analysis ──────────────
 
     # ── 1. live_chat_normalized.csv ───────────────────────────────────────────
-    chat_path = OUTPUT_DIR / "live_chat_normalized.csv"
+    chat_path = INTERMEDIATE_DIR / "live_chat_normalized.csv"
     if not chat_path.exists():
-        print("ERROR: output/live_chat_normalized.csv not found.")
-        print("       Run: python extract_live_chat.py <URL>")
+        print("ERROR: output/intermediate/live_chat_normalized.csv not found.")
+        print("       Run: python extract_live_chat.py <URL> --output-dir output/intermediate")
         sys.exit(1)
 
     messages = []
@@ -2801,8 +3026,8 @@ def load_data() -> dict:
     d["active_participants"] = active_participants
 
     # ── 2. highlight_package.json (spike_moments.csv fallback) ───────────────
-    hp_path       = OUTPUT_DIR / "highlight_package.json"
-    spike_csv_path = OUTPUT_DIR / "spike_moments.csv"
+    hp_path        = INTERMEDIATE_DIR / "highlight_package.json"
+    spike_csv_path = INTERMEDIATE_DIR / "spike_moments.csv"
 
     spike_moments, title_suggestions, shorts_sequences, hp_meta = [], [], [], {}
 
@@ -3173,16 +3398,199 @@ def _build_discovery_narrative(
 # ── Story builder ─────────────────────────────────────────────────────────────
 
 def build_story(d: dict, is_summary: bool = False) -> list:
+    """
+    Top-level story builder — routes to the appropriate section set based on mode.
+
+      'combined'  → _build_combined_story: live-chat spike analysis + comment layer
+      'comments'  → _build_comments_story: comment-only report (no spike data)
+    """
+    if d.get("mode") == "comments":
+        return _build_comments_story(d)
+    return _build_combined_story(d, is_summary)
+
+
+def _build_comments_story(d: dict) -> list:
+    """
+    Comments-only report sections.
+    Used when live-chat data is unavailable.
+
+    Sections:
+      Cover + stats
+      Keywords & sentiment
+      Top comments
+      Content strategy & limitations
+    """
+    story = []
+    P = Paragraph
+    cd = d["comment_data"]   # shorthand
+
+    # Cover
+    story.append(P("시청자 반응 분석 리포트", STYLES["h1"]))
+    story.append(P(
+        f"Video: {cd['comments'][0].get('video_id', '—') if cd['comments'] else '—'}"
+        " &nbsp;·&nbsp; 유튜브 댓글 기반 시청자 반응 분석",
+        STYLES["subtitle"]))
+    story.append(rule(BLUE, 1.5))
+    story.append(vspace(3))
+
+    fw = PW - 2 * M
+    ml = ParagraphStyle("mt_l", fontName="KR-Bold", fontSize=8, textColor=GREY, wordWrap="CJK")
+    mv = ParagraphStyle("mt_v", fontName="KR", fontSize=8.5, textColor=BLACK, wordWrap="CJK")
+    vid = cd["comments"][0].get("video_id", "—") if cd["comments"] else "—"
+    meta_tbl = Table([
+        [P("Video ID",  ml), P(vid, mv),
+         P("분석 유형", ml), P("댓글 기반 (라이브채팅 없음)", mv)],
+        [P("댓글 범위", ml),
+         P(f"일반 댓글 {cd['top_level_count']}개 + 답글 {cd['reply_count']}개", mv),
+         P("생성일",   ml), P(cd["generated_date"] or "—", mv)],
+    ], colWidths=[fw * 0.14, fw * 0.36, fw * 0.14, fw * 0.36])
+    meta_tbl.setStyle(TableStyle([
+        ("BACKGROUND",    (0, 0), (0, -1), BLUE_LIGHT),
+        ("BACKGROUND",    (2, 0), (2, -1), BLUE_LIGHT),
+        ("FONTNAME",      (0, 0), (-1, -1), "KR"),
+        ("FONTSIZE",      (0, 0), (-1, -1), 8.5),
+        ("TOPPADDING",    (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ("LEFTPADDING",   (0, 0), (-1, -1), 6),
+        ("RIGHTPADDING",  (0, 0), (-1, -1), 6),
+        ("GRID",          (0, 0), (-1, -1), 0.4, SLATE_MID),
+    ]))
+    story.append(meta_tbl)
+    story.append(vspace(4))
+
+    story.append(stat_table([
+        ("전체 댓글",   str(cd["total_comments"])),
+        ("고유 작성자", str(cd["unique_authors"])),
+        ("총 좋아요",   str(cd["total_likes"])),
+        ("최대 좋아요", str(cd["max_likes"])),
+    ]))
+    story.append(vspace(6))
+
+    story.extend(section_heading("핵심 요약"))
+    if cd["dominant_sentiment"]:
+        story.append(callout(
+            f"<b>주도적 감정 톤:</b> <b>{cd['dominant_sentiment']}</b> — "
+            "하위 고좋아요 댓글과 키워드 데이터를 함께 검토하십시오. "
+            "<b>빈도와 감정 강도는 다를 수 있습니다.</b>"
+        ))
+        story.append(vspace(3))
+    if cd["themes"]:
+        story.append(P("고관여 테마", STYLES["h3"]))
+        for theme in cd["themes"]:
+            story.append(bullet(f"<b>{theme}</b>"))
+        story.append(vspace(3))
+    if cd["recommendations"]:
+        story.append(P("콘텐츠 전략 핵심", STYLES["h3"]))
+        for rec in cd["recommendations"][:3]:
+            story.append(bullet(rec))
+        story.append(vspace(3))
+
+    story.append(note_box(
+        "⚠ 이 리포트는 <b>일반 댓글만</b> 분석했습니다. "
+        "라이브채팅 리플레이가 없으므로 스파이크·실시간 반응 분석은 포함되지 않습니다. "
+        "다음 번 방송은 ./generate_report config.json (analyze_live_chat: true) 로 실행하면 "
+        "완전한 결합 리포트를 받을 수 있습니다."
+    ))
+    story.append(PageBreak())
+
+    # Keywords & sentiment
+    story.extend(section_heading("1.  키워드 분석"))
+    if cd["unigrams"]:
+        top_uni = cd["unigrams"][:8]
+        story.append(P("단어 빈도 상위 8위", STYLES["h3"]))
+        story.append(vspace(1))
+        story.append(bar_chart(
+            [(r["phrase"], r["count"]) for r in top_uni],
+            top_uni[0]["count"], BLUE))
+        story.append(vspace(4))
+    if cd["bigrams"]:
+        story.append(P("구문 빈도 상위 (2단어 구)", STYLES["h3"]))
+        story.append(info_table(
+            ["구문", "빈도"],
+            [(r["phrase"], str(r["count"])) for r in cd["bigrams"][:8]],
+            col_widths=[0.75, 0.25]))
+        story.append(vspace(5))
+
+    if cd["sentiment_rows"]:
+        story.extend(section_heading("2.  감정 분류 현황"))
+        story.append(info_table(
+            ["감정 유형", "댓글 수", "비율"],
+            [(r[0], r[1], r[2]) for r in cd["sentiment_rows"]],
+            col_widths=[0.50, 0.25, 0.25]))
+        story.append(vspace(3))
+        if cd["dominant_sentiment"]:
+            story.append(callout(
+                f"<b>지배적 감정:</b> {cd['dominant_sentiment']} — "
+                "자동 분류는 어휘 빈도 기반입니다. "
+                "상위 좋아요 댓글을 직접 확인해 검증하십시오."
+            ))
+        story.append(vspace(4))
+
+    if cd["top_authors"]:
+        story.extend(section_heading("3.  주요 작성자"))
+        story.append(info_table(
+            ["작성자", "댓글 수", "총 좋아요"],
+            [(r["author"], str(r["comment_count"]), str(r["total_likes"]))
+             for r in cd["top_authors"][:10]],
+            col_widths=[0.55, 0.225, 0.225]))
+    story.append(PageBreak())
+
+    # Top comments
+    story.extend(section_heading("4.  반응이 강했던 원댓글"))
+    story.append(P(
+        "상위 좋아요 댓글은 '무엇이 논점이었는지'를 직접 보여줍니다. "
+        "클립 셀렉션과 썸네일 문구의 출발점으로 활용하십시오.",
+        STYLES["body"]))
+    story.append(vspace(3))
+    for c in cd["top_comments"]:
+        for flowable in quote_card(str(c["like_count"]), c["author"], c["text"]):
+            story.append(flowable)
+    story.append(PageBreak())
+
+    # Content strategy
+    story.extend(section_heading("5.  콘텐츠 전략 시사점"))
+    if cd["recommendations"]:
+        for i, rec in enumerate(cd["recommendations"], 1):
+            story.append(P(f"{i}.&nbsp; {rec}", STYLES["body_left"]))
+            story.append(vspace(1))
+        story.append(vspace(3))
+    if cd["title_suggestions"]:
+        story.extend(section_heading("6.  추천 영상 제목"))
+        for ts in cd["title_suggestions"]:
+            story.append(bullet(ts))
+        story.append(vspace(4))
+    if cd["marketing_angles"]:
+        story.extend(section_heading("7.  마케팅·스폰서 각도"))
+        for angle in cd["marketing_angles"]:
+            story.append(bullet(angle))
+        story.append(vspace(4))
+
+    story.extend(section_heading("분석 한계 및 주의사항"))
+    for lim in (cd["limitations"] or [
+        "<b>댓글 전용:</b> 라이브채팅 리플레이는 이번 분석에 포함되지 않았습니다.",
+        "<b>타임스탬프 없음:</b> 일반 댓글에는 영상 타임스탬프가 없어 장면 매핑이 불가능합니다.",
+        "<b>감정 분류 한계:</b> 규칙 기반 어휘 매칭은 반어, 복합 감정을 잡지 못합니다.",
+    ]):
+        story.append(bullet(lim))
+
+    return story
+
+
+def _build_combined_story(d: dict, is_summary: bool = False) -> list:
+    """
+    Full combined report: live-chat spike analysis + audience comment layer.
+    Used when both live chat and comment data are available.
+    """
     story = []
     P = Paragraph
 
     # ═══════════════════════════════════════════════════════════════
     # PAGE 1 — Cover + Stats
     # ═══════════════════════════════════════════════════════════════
-    story.append(P("라이브 채팅 기반<br/>하이라이트 인사이트 리포트", STYLES["h1"]))
+    story.append(P("시청자 반응 분석 리포트", STYLES["h1"]))
     story.append(P(
         "Video: " + d["video_id"] +
-        " \u00b7 실시간 반응의 밀집 구간에서 무슨 일이 있었는지를 해석합니다",
+        " \u00b7 댓글 · 실시간 채팅 통합 분석 — 무슨 일이 있었는지를 해석합니다",
         STYLES["subtitle"]))
     story.append(rule(BLUE, 1.5))
     story.append(vspace(3))
@@ -3254,6 +3662,37 @@ def build_story(d: dict, is_summary: bool = False) -> list:
             "자막 세그먼트 " + str(d["segment_count"]) + "개가 로드됐습니다. "
             "스파이크 구간 해석에 해설자 음성이 함께 활용됩니다."
         ))
+
+    # ── Comment narrative overview on cover (both full and summary) ───────────
+    #    Live chat = moment-by-moment reactions.
+    #    VOD comments = settled, post-viewing interpretation.
+    #    Showing both signals together on page 1 frames the whole report.
+    _cd = d.get("comment_data", {})
+    if _cd.get("total_comments", 0) > 0 or _cd.get("dominant_sentiment") or _cd.get("themes"):
+        story.append(vspace(4))
+        story.extend(section_heading("시청자 전체 반응 개요 (VOD 댓글)"))
+        story.append(P(
+            "라이브 채팅이 '방송 중 순간 반응'이라면, VOD 댓글은 "
+            "<b>시청 후 숙성된 해석</b>입니다. "
+            "어떤 장면이 기억에 남았는지, 시청자가 방송을 어떻게 읽었는지를 더 넓은 시각으로 "
+            "보여줍니다. 상세 댓글 분석은 후반 섹션을 참조하십시오.",
+            STYLES["body"]))
+        story.append(vspace(2))
+        if _cd.get("dominant_sentiment"):
+            story.append(callout(
+                f"<b>댓글 지배 감정 톤:</b> <b>{_cd['dominant_sentiment']}</b>"
+                " — 아래 스파이크 해석을 읽을 때 이 감정 맥락을 염두에 두십시오."))
+            story.append(vspace(2))
+        if _cd.get("themes"):
+            story.append(P("고관여 테마", STYLES["h3"]))
+            for _theme in _cd["themes"]:
+                story.append(bullet(f"<b>{_theme}</b>"))
+            story.append(vspace(2))
+        if _cd.get("top_comments"):
+            story.append(P("가장 반응이 강했던 댓글", STYLES["h3"]))
+            _tc = _cd["top_comments"][0]
+            for _f in quote_card(str(_tc["like_count"]), _tc["author"], _tc["text"]):
+                story.append(_f)
 
     story.append(PageBreak())
 
@@ -4367,12 +4806,75 @@ def build_story(d: dict, is_summary: bool = False) -> list:
         story.append(PageBreak())
 
     # ═══════════════════════════════════════════════════════════════
-    # PAGE 9 — Data requirements + Limitations  (full report only)
+    # Section 9 — Audience Comment Analysis (BOTH full and summary)
+    #   Live chat = moment-by-moment reactions during broadcast.
+    #   VOD comments = settled audience interpretation after viewing.
+    #   Both signals belong in the summary as well as the full report.
     # ═══════════════════════════════════════════════════════════════
-    if is_summary:
-        return story   # summary ends after Section 8-B
+    cd = d.get("comment_data", {})
+    if cd.get("total_comments", 0) > 0:
+        story.append(PageBreak())
+        story.extend(section_heading("9.  시청자 댓글 분석 — 방송 후 반응"))
+        story.append(P(
+            "라이브 채팅이 '방송 중 순간 반응'이라면, VOD 댓글은 "
+            "<b>시청 후 숙성된 해석</b>입니다. "
+            "어떤 장면이 기억에 남았는지, 시청자가 방송 전체를 어떻게 평가했는지를 보여줍니다.",
+            STYLES["body"]))
+        story.append(vspace(3))
 
-    story.extend(section_heading("추가 데이터 요구사항 및 분석 한계"))
+        story.append(stat_table([
+            ("전체 댓글",   str(cd["total_comments"])),
+            ("고유 작성자", str(cd["unique_authors"])),
+            ("총 좋아요",   str(cd["total_likes"])),
+            ("최대 좋아요", str(cd["max_likes"])),
+        ]))
+        story.append(vspace(5))
+
+        if cd.get("dominant_sentiment"):
+            story.append(callout(
+                f"<b>댓글 지배 감정 톤:</b> <b>{cd['dominant_sentiment']}</b>"))
+            story.append(vspace(3))
+
+        if cd.get("themes"):
+            story.append(P("고관여 테마", STYLES["h3"]))
+            for theme in cd["themes"]:
+                story.append(bullet(f"<b>{theme}</b>"))
+            story.append(vspace(3))
+
+        # Keyword bar chart — full report only (too dense for summary)
+        if not is_summary and cd.get("unigrams"):
+            story.append(P("댓글 빈도 키워드 상위", STYLES["h3"]))
+            top_uni = cd["unigrams"][:8]
+            story.append(bar_chart(
+                [(r["phrase"], r["count"]) for r in top_uni],
+                top_uni[0]["count"], BLUE))
+            story.append(vspace(4))
+
+        if cd.get("top_comments"):
+            story.append(P("좋아요 상위 댓글", STYLES["h3"]))
+            story.append(vspace(1))
+            _comment_limit = 3 if is_summary else 5
+            for c in cd["top_comments"][:_comment_limit]:
+                for flowable in quote_card(str(c["like_count"]), c["author"], c["text"]):
+                    story.append(flowable)
+            story.append(vspace(3))
+
+        # Strategy recommendations — full report only
+        if not is_summary and cd.get("recommendations"):
+            story.append(P("댓글 기반 콘텐츠 전략", STYLES["h3"]))
+            for i, rec in enumerate(cd["recommendations"][:3], 1):
+                story.append(P(f"{i}.&nbsp; {rec}", STYLES["body_left"]))
+                story.append(vspace(1))
+
+    # Summary ends after Section 9
+    if is_summary:
+        return story
+
+    # ═══════════════════════════════════════════════════════════════
+    # Full report only — methodology notes + limitations
+    # ═══════════════════════════════════════════════════════════════
+    if cd.get("total_comments", 0) > 0:
+        story.append(PageBreak())
 
     story.append(P("<b>두 신호 연결 방식</b>", STYLES["h3"]))
     story.append(P(
@@ -4428,9 +4930,13 @@ def build_story(d: dict, is_summary: bool = False) -> list:
         story.append(bullet(item))
     story.append(vspace(3))
 
+    story.append(PageBreak())
+
+    # ── Limitations ───────────────────────────────────────────────────────────
+    story.extend(section_heading("10.  추가 데이터 요구사항 및 분석 한계"))
+
     story.append(P("<b>분석 한계</b>", STYLES["h3"]))
     for lim in [
-        "라이브 채팅 전용: VOD 댓글 분석은 generate_report_by_comment.py를 별도 실행하십시오.",
         "스파이크 = 밀집도 기반: 반응 품질(긍정/부정)이 아닌 메시지 수로 피크를 감지합니다.",
         "반응 유형 분류는 규칙 기반입니다. 문맥에 따른 반어·복합 감정은 포착되지 않습니다.",
         "타임스탬프 정밀도: yt-dlp 기준이며 실제 편집점과 수초 차이가 있을 수 있습니다.",
@@ -4449,26 +4955,35 @@ def build_story(d: dict, is_summary: bool = False) -> list:
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    print("[live_chat_report] 데이터 로딩 중...")
+    mode = detect_mode()
+    print(f"[report] Mode: {mode}")
+    print("[report] 데이터 로딩 중...")
     d = load_data()
-    print(f"[live_chat_report] 스파이크 {d['spike_count']}개 로드 / "
-          f"세그먼트: {'있음' if d['has_segments'] else '없음'}")
+
+    if mode == "combined":
+        print(f"[report] 스파이크 {d['spike_count']}개 로드 / "
+              f"댓글 {d['comment_data']['total_comments']}개 / "
+              f"세그먼트: {'있음' if d['has_segments'] else '없음'}")
+    else:
+        print(f"[report] 댓글 {d['comment_data']['total_comments']}개 로드 "
+              "(라이브채팅 없음 — 댓글 전용 모드)")
 
     # ── Full report ───────────────────────────────────────────────────────────
-    print("[live_chat_report] 전체 리포트 생성 중...")
-    out_full = str(OUTPUT_DIR / "live_chat_insight_report.pdf")
+    print("[report] 리포트 생성 중...")
+    out_full = str(OUTPUT_DIR / "insight_report.pdf")
     doc_full = make_doc(out_full)
     doc_full.build(build_story(d, is_summary=False))
     size_full = Path(out_full).stat().st_size // 1024
-    print(f"[live_chat_report] 완료: {out_full}  ({size_full} KB)")
+    print(f"[report] 완료: {out_full}  ({size_full} KB)")
 
-    # ── Summary report ────────────────────────────────────────────────────────
-    print("[live_chat_report] 요약 리포트 생성 중...")
-    out_summ = str(OUTPUT_DIR / "live_chat_summary_report.pdf")
-    doc_summ = make_doc(out_summ)
-    doc_summ.build(build_story(d, is_summary=True))
-    size_summ = Path(out_summ).stat().st_size // 1024
-    print(f"[live_chat_report] 완료: {out_summ}  ({size_summ} KB)")
+    # ── Summary report (combined mode only) ──────────────────────────────────
+    if mode == "combined":
+        print("[report] 요약 리포트 생성 중...")
+        out_summ = str(OUTPUT_DIR / "insight_report_summary.pdf")
+        doc_summ = make_doc(out_summ)
+        doc_summ.build(build_story(d, is_summary=True))
+        size_summ = Path(out_summ).stat().st_size // 1024
+        print(f"[report] 완료: {out_summ}  ({size_summ} KB)")
 
 
 if __name__ == "__main__":

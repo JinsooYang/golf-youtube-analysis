@@ -53,11 +53,18 @@ BLUE='\033[0;34m'
 NC='\033[0m'
 
 # ── 인자 확인 ──────────────────────────────────────────────────────────────────
+SUBTITLES_ONLY=0
+if [ "${1:-}" = "--subtitles-only" ]; then
+    SUBTITLES_ONLY=1
+    shift
+fi
+
 if [ -z "$1" ]; then
-    echo -e "${RED}❌ 사용법: $0 \"YouTube_URL\"${NC}"
+    echo -e "${RED}❌ 사용법: $0 [--subtitles-only] \"YouTube_URL\"${NC}"
     echo ""
     echo "예시:"
     echo "  $0 \"https://www.youtube.com/watch?v=Ef5fYM-WiPA\""
+    echo "  $0 --subtitles-only \"https://www.youtube.com/watch?v=Ef5fYM-WiPA\""
     exit 1
 fi
 
@@ -102,41 +109,42 @@ echo ""
 
 SAFE_TITLE=$(echo "$TITLE" | tr -cd '[:alnum:] _-' | tr ' ' '_' | cut -c1-50)
 
-# ── 2. 영상 다운로드 (720p) — 주 목표 ──────────────────────────────────────────
-echo -e "${YELLOW}[2/3] 🎬 영상 다운로드 중 (720p)...${NC}"
+# ── 2. 영상 다운로드 (720p) — --subtitles-only 시 건너뜀 ──────────────────────
+if [ "$SUBTITLES_ONLY" -eq 0 ]; then
+    echo -e "${YELLOW}[2/3] 🎬 영상 다운로드 중 (720p)...${NC}"
 
-# Format strategy:
-#   1st choice: best video ≤720p (any codec) + best audio, merged to mp4 via ffmpeg
-#   2nd choice: best combined stream ≤720p (format 18 etc.) — no merge needed
-#   3rd choice: any best available — last resort
-YTDLP_FMT="bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=720]+bestaudio/best[height<=720]/best"
+    # Format strategy:
+    #   1st choice: best video ≤720p (any codec) + best audio, merged to mp4 via ffmpeg
+    #   2nd choice: best combined stream ≤720p (format 18 etc.) — no merge needed
+    #   3rd choice: any best available — last resort
+    YTDLP_FMT="bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=720]+bestaudio/best[height<=720]/best"
 
-yt-dlp -f "$YTDLP_FMT" --merge-output-format mp4 \
-    -o "${VIDEO_FILE}" "$URL" 2>"${VIDEO_FILE%.mp4}_dl.log"
-RC=$?
+    yt-dlp -f "$YTDLP_FMT" --merge-output-format mp4 \
+        -o "${VIDEO_FILE}" "$URL" 2>"${VIDEO_FILE%.mp4}_dl.log"
+    RC=$?
 
-# Fallback: relax to any available format, allow any container extension
-if [ $RC -ne 0 ] || [ ! -f "$VIDEO_FILE" ]; then
-    yt-dlp -f "bestvideo+bestaudio/best" --merge-output-format mp4 \
-        -o "video.%(ext)s" "$URL" 2>>"${VIDEO_FILE%.mp4}_dl.log"
-    FOUND_VID=$(ls video.mp4 video.webm video.mkv 2>/dev/null | head -1)
-    if [ -n "$FOUND_VID" ]; then
-        VIDEO_FILE="$FOUND_VID"
+    # Fallback: relax to any available format, allow any container extension
+    if [ $RC -ne 0 ] || [ ! -f "$VIDEO_FILE" ]; then
+        yt-dlp -f "bestvideo+bestaudio/best" --merge-output-format mp4 \
+            -o "video.%(ext)s" "$URL" 2>>"${VIDEO_FILE%.mp4}_dl.log"
+        FOUND_VID=$(ls video.mp4 video.webm video.mkv 2>/dev/null | head -1)
+        if [ -n "$FOUND_VID" ]; then
+            VIDEO_FILE="$FOUND_VID"
+        fi
     fi
-fi
 
-if [ -f "$VIDEO_FILE" ]; then
-    HAS_VIDEO=1
-    echo -e "      ${GREEN}✅ 영상 저장: ${VIDEO_FILE}${NC}"
-else
-    echo -e "${RED}❌ 영상 다운로드 실패${NC}"
-    LOG_FILE="${VIDEO_FILE%.mp4}_dl.log"
-    if [ -f "$LOG_FILE" ]; then
-        echo -e "${RED}   오류 로그 (마지막 15줄):${NC}"
-        tail -15 "$LOG_FILE" | sed 's/^/   /'
-    fi
-    # Write minimal metadata even on video failure so the folder is useful
-    python3 -c "
+    if [ -f "$VIDEO_FILE" ]; then
+        HAS_VIDEO=1
+        echo -e "      ${GREEN}✅ 영상 저장: ${VIDEO_FILE}${NC}"
+    else
+        echo -e "${RED}❌ 영상 다운로드 실패${NC}"
+        LOG_FILE="${VIDEO_FILE%.mp4}_dl.log"
+        if [ -f "$LOG_FILE" ]; then
+            echo -e "${RED}   오류 로그 (마지막 15줄):${NC}"
+            tail -15 "$LOG_FILE" | sed 's/^/   /'
+        fi
+        # Write minimal metadata even on video failure so the folder is useful
+        python3 -c "
 import json, sys
 meta = {
     'videoId': '${VIDEO_ID}',
@@ -154,9 +162,13 @@ meta = {
 with open('video_meta.json', 'w') as f:
     json.dump(meta, f, ensure_ascii=False, indent=2)
 " 2>/dev/null
-    exit 1
+        exit 1
+    fi
+    echo ""
+else
+    echo -e "${YELLOW}[--subtitles-only] 영상 다운로드 건너뜀 — 자막만 추출합니다${NC}"
+    echo ""
 fi
-echo ""
 
 # ── 3. 자막 다운로드 (선택) ────────────────────────────────────────────────────
 echo -e "${YELLOW}[3/3] 📝 자막 다운로드 시도 중...${NC}"
